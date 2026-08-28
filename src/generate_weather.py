@@ -753,6 +753,8 @@ MAP_CARD = """<div class="card"><h2><span class="no">6</span>川渝全站点实�
     live.push(mk);
   });
   var liveLayer=L.layerGroup(live).addTo(map);
+  window.__WEATHER_MAP=map; window.__WEATHER_STATIONS=STATIONS; window.__WEATHER_LIVE=LIVE;
+  window.__WEATHER_DATA=DATA; window.__WEATHER_COLOR=colorOf; window.__WEATHER_RAD=radOf; window.__WEATHER_RADFIX=radFix;
 
   function stamp(txt){var e=document.getElementById('liveTs'); if(e)e.textContent=txt;}
   stamp('实况由生成时服务端一次抓取（'+__LIVE_TS__+'），浏览器每10分钟轻量追更');
@@ -826,37 +828,86 @@ MAP_CARD = """<div class="card"><h2><span class="no">6</span>川渝全站点实�
 (function(){
   var o=document.getElementById('shareOverlay'); if(o&&o.parentNode&&o.parentNode!==document.body) document.body.appendChild(o);
   window.__shareCanvas=null;
-  function loadH2c(cb){ if(window.html2canvas) return cb(); var s=document.createElement('script');
-    s.src='https://cdn.staticfile.org/html2canvas/1.4.1/html2canvas.min.js';
-    s.onload=cb; s.onerror=cb; document.head.appendChild(s); }
-  function drawTitle(x,W,y,txt){ x.fillStyle='#12395b'; x.font='bold 24px "PingFang SC","Microsoft YaHei",sans-serif'; x.textAlign='center'; x.fillText(txt,W/2,y); }
-  window.shareMapCard6=function(){
-    loadH2c(function(){
-      var mapEl=document.getElementById('heatmax'), leg=document.querySelector('.heat-legend');
-      if(!mapEl||!window.html2canvas||!leg) return;
-      html2canvas(mapEl,{useCORS:true,scale:2,backgroundColor:'#e9edf2',
-        onclone:function(doc){ var c=doc.querySelector('.leaflet-control-container'); if(c)c.style.display='none';
-          var hl=doc.querySelector('.leaflet-attribution-flag'); if(hl)hl.remove(); }
-      }).then(function(c1){
-        html2canvas(leg,{useCORS:true,scale:2,backgroundColor:null}).then(function(c2){
-          var pad=18,gap=16,tbar=44,W=Math.max(c1.width,c2.width)+pad*2,H=c1.height+c2.height+gap+pad*2+tbar;
-          var cv=document.createElement('canvas'); cv.width=W; cv.height=H;
-          var x=cv.getContext('2d');
-          x.fillStyle='#ffffff'; x.fillRect(0,0,W,H);
-          drawTitle(x,W,pad+26,'川渝全站点实况分布 · 实时地图');
-          x.drawImage(c1,Math.round((W-c1.width)/2),pad+tbar);
-          x.drawImage(c2,Math.round((W-c2.width)/2),pad+tbar+c1.height+gap);
-          window.__shareCanvas=cv;
-          var img=document.getElementById('shareImg'); if(img)img.src=cv.toDataURL('image/png');
-          var ov=document.getElementById('shareOverlay'); if(ov)ov.style.display='flex';
-        });
-      });
-    });
-  };
-  window.downloadShare=function(){ var cv=window.__shareCanvas; if(!cv)return;
-    var a=document.createElement('a'); a.href=cv.toDataURL('image/png'); a.download='川渝实况地图.png'; a.click(); };
   function toast(t){ var e=document.getElementById('shareToast'); if(e){ e.textContent=t; e.style.opacity='1';
     clearTimeout(e._t); e._t=setTimeout(function(){e.style.opacity='0';},1800); } }
+  /* 画布重绘分享图：瓦片与点位共用同一 Leaflet 投影，保证严格对齐（规避 html2canvas 对瓦片 transform 的偏移缺陷） */
+  function renderSharePicture(){
+    return new Promise(function(res){
+      var map=window.__WEATHER_MAP; if(!map){ res(null); return; }
+      var EW=1280, EH=620;
+      var z=Math.round(map.getZoom())||6;
+      var center=map.getCenter();
+      var cpx=map.project(center,z);
+      var tlx=cpx.x-EW/2, tly=cpx.y-EH/2;
+      var scale=Math.max(1,map.getSize().x?EW/map.getSize().x:1);
+      var mcv=document.createElement('canvas'); mcv.width=EW; mcv.height=EH;
+      var mc=mcv.getContext('2d');
+      mc.fillStyle='#e9edf2'; mc.fillRect(0,0,EW,EH);
+      function circ(ptx,pty,r,fill){ mc.beginPath(); mc.arc(ptx,pty,r,0,Math.PI*2);
+        mc.fillStyle=fill; mc.fill(); mc.lineWidth=Math.max(1,r/6); mc.strokeStyle='rgba(255,255,255,.92)'; mc.stroke(); }
+      function drawData(){
+        (window.__WEATHER_DATA||[]).forEach(function(p){ if(p.lat==null)return;
+          var pt=map.project(L.latLng(p.lat,p.lng),z);
+          var R=(window.__WEATHER_RADFIX?window.__WEATHER_RADFIX(p.tmax):10)*scale;
+          circ(pt.x-tlx,pt.y-tly,R,window.__WEATHER_COLOR?window.__WEATHER_COLOR(p.tmax):'#8aa0b5'); });
+        var sts=window.__WEATHER_STATIONS||[], LIVE=window.__WEATHER_LIVE||[];
+        sts.forEach(function(s,i){ if(s.lat==null)return;
+          var oo=LIVE&&LIVE[i],T=oo?oo[0]:null;
+          var pt=map.project(L.latLng(s.lat,s.lng),z);
+          var R=(T!=null?(window.__WEATHER_RAD?window.__WEATHER_RAD(T):8):5)*scale;
+          circ(pt.x-tlx,pt.y-tly,R,T!=null?(window.__WEATHER_COLOR?window.__WEATHER_COLOR(T):'#8aa0b5'):'#8aa0b5'); });
+        compose(mcv);
+      }
+      /* 加载可见瓦片 */
+      var turl='https://webrd01.is.autonavi.com/appmaptile?lang=zh_cn&size=1&scale=1&style=8&x={x}&y={y}&z={z}';
+      var mnx=Math.floor(tlx/256), mxx=Math.ceil((tlx+EW)/256);
+      var mny=Math.floor(tly/256), mxy=Math.ceil((tly+EH)/256);
+      var todo=0, done=0;
+      function fin(){ done++; if(done>=todo) drawData(); }
+      for(var ty=mny;ty<=mxy;ty++)for(var tx=mnx;tx<=mxx;tx++){
+        (function(tx,ty){ todo++;
+          var img=new Image(); img.crossOrigin='anonymous';
+          img.onload=function(){ mc.drawImage(img,Math.round(tx*256-tlx),Math.round(ty*256-tly)); fin(); };
+          img.onerror=fin;
+          img.src=turl.replace('{x}',tx).replace('{y}',ty).replace('{z}',z);
+        })(tx,ty);
+      }
+      if(todo===0) drawData();
+      function compose(mcv2){
+        var pad=18,gap=16,tbar=46;
+        var W=mcv2.width+pad*2, H=pad+tbar+mcv2.height+gap+34+pad;
+        var cv=document.createElement('canvas'); cv.width=W; cv.height=H;
+        var x=cv.getContext('2d');
+        x.fillStyle='#ffffff'; x.fillRect(0,0,W,H);
+        x.fillStyle='#12395b'; x.font='700 27px "PingFang SC","Microsoft YaHei",sans-serif'; x.textAlign='center';
+        x.fillText('川渝全站点实况分布 · 实时地图', W/2, pad+31);
+        x.drawImage(mcv2, pad, pad+tbar);
+        var items=[['#c23b2e','≥35'],['#ff7a2f','33–34.9'],['#f2c23b','30–32.9'],['#58b3e0','25–29.9'],['#3a79c2','<25'],['#8aa0b5','缺测']];
+        var ly=pad+tbar+mcv2.height+gap+20, lx=pad;
+        x.textAlign='left';
+        x.fillStyle='#12395b'; x.font='700 17px "PingFang SC","Microsoft YaHei",sans-serif'; x.fillText('实况气温分级（℃）',lx,ly);
+        lx+= x.measureText('实况气温分级（℃）').width+16;
+        x.font='15px "PingFang SC","Microsoft YaHei",sans-serif';
+        items.forEach(function(it){
+          x.beginPath(); x.arc(lx+8,ly-5,8,0,Math.PI*2); x.fillStyle=it[0]; x.fill();
+          x.lineWidth=1; x.strokeStyle='rgba(0,0,0,.16)'; x.stroke();
+          lx+=24; x.fillStyle='#41556a'; x.fillText(it[1],lx,ly);
+          lx+= x.measureText(it[1]).width+26;
+        });
+        window.__shareCanvas=cv; res(cv);
+      }
+    });
+  }
+  window.shareMapCard6=function(){
+    renderSharePicture().then(function(cv){
+      if(!cv){ toast('分享渲染失败，请稍后重试'); return; }
+      var img=document.getElementById('shareImg'); if(img) img.src=cv.toDataURL('image/png');
+      var ov=document.getElementById('shareOverlay'); if(ov) ov.style.display='flex';
+      toast('已生成带实况的地图分享图');
+    });
+  };
+  window.downloadShare=function(){ var cv=window.__shareCanvas; if(!cv)return toast('请先点击分享生成图片');
+    var a=document.createElement('a'); a.href=cv.toDataURL('image/png'); a.download='川渝实况地图.png'; a.click(); };
   window.copyShare=function(){ var cv=window.__shareCanvas; if(!cv)return toast('请先点击分享生成图片');
     cv.toBlob(function(blob){
       if(!blob) return toast('生成失败，请使用下载');
