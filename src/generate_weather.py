@@ -813,12 +813,14 @@ MAP_CARD = """<div class="card"><h2><span class="no">6</span>川渝全站点实�
 .share-foot button{border:none;border-radius:20px;padding:8px 22px;font-size:14px;font-weight:700;cursor:pointer}
 .share-foot .dl{background:#12395b;color:#fff}
 .share-foot .cancel{background:#eef2f6;color:#41556a}
+.share-foot .copy{background:#e8773c;color:#fff}
+.share-foot .share{background:#1fa463;color:#fff}
 </style>
 <div class="share-zone"><button class="share-btn" onclick="shareMapCard6()">📷 分享地图（带实况 · 图片）</button></div>
 <div id="shareOverlay"><div class="share-box">
   <div class="share-head"><b>川渝全站点实况分布 · 分享图片</b><button onclick="closeShare()">✕</button></div>
   <div class="share-body"><img id="shareImg" alt="分享地图"/></div>
-  <div class="share-foot"><button class="dl" onclick="downloadShare()">⬇ 下载 PNG</button><button class="cancel" onclick="closeShare()">关闭</button></div>
+  <div class="share-foot"><button class="copy" onclick="copyShare()">📋 复制图片</button><button class="share" id="nativeShareBtn" style="display:none" onclick="nativeShare()">📤 系统分享</button><button class="dl" onclick="downloadShare()">⬇ 下载 PNG</button><button class="cancel" onclick="closeShare()">关闭</button></div>
 </div></div>
 <script>
 (function(){
@@ -853,9 +855,33 @@ MAP_CARD = """<div class="card"><h2><span class="no">6</span>川渝全站点实�
   };
   window.downloadShare=function(){ var cv=window.__shareCanvas; if(!cv)return;
     var a=document.createElement('a'); a.href=cv.toDataURL('image/png'); a.download='川渝实况地图.png'; a.click(); };
+  function toast(t){ var e=document.getElementById('shareToast'); if(e){ e.textContent=t; e.style.opacity='1';
+    clearTimeout(e._t); e._t=setTimeout(function(){e.style.opacity='0';},1800); } }
+  window.copyShare=function(){ var cv=window.__shareCanvas; if(!cv)return toast('请先点击分享生成图片');
+    cv.toBlob(function(blob){
+      if(!blob) return toast('生成失败，请使用下载');
+      if(navigator.clipboard && window.ClipboardItem){
+        navigator.clipboard.write([new ClipboardItem({'image/png':blob})])
+          .then(function(){ toast('✓ 图片已复制，可直接粘贴到微信/备忘录'); })
+          .catch(function(){ toast('复制被浏览器拦截，请使用下载'); });
+      } else { toast('当前浏览器不支持复制图片，请使用下载'); }
+    },'image/png');
+  };
+  window.nativeShare=function(){ var cv=window.__shareCanvas; if(!cv)return toast('请先点击分享生成图片');
+    cv.toBlob(function(blob){ var f=new File([blob],'川渝实况地图.png',{type:'image/png'});
+      navigator.share({title:'川渝全站点实况分布',text:'实时地图',files:[f]}).catch(function(){});
+    },'image/png');
+  };
   window.closeShare=function(){ var ov=document.getElementById('shareOverlay'); if(ov)ov.style.display='none'; };
+  (function(){ if(navigator.share && navigator.canShare){
+    var t=null; try{ var f=new File(['a'],'x.png',{type:'image/png'}); t=navigator.canShare({files:[f]}); }catch(e){ t=false; }
+    var b=document.getElementById('nativeShareBtn'); if(b&&t) b.style.display='';
+  } })();
 })();
 </script>
+<div id="shareToast" style="position:fixed;left:50%;bottom:42px;transform:translateX(-50%);z-index:100000;
+  background:rgba(20,32,48,.92);color:#fff;font-size:13px;padding:9px 16px;border-radius:8px;
+  opacity:0;transition:opacity .25s;pointer-events:none;max-width:80vw;text-align:center"></div>
 </div>
 """
 
