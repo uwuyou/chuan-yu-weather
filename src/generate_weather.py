@@ -257,17 +257,24 @@ def fetch_city(name, pinyin):
     real = data.get("real") or {}
     weat = real.get("weather") or {}
     days = []
-    for dd in ((data.get("predict") or {}).get("detail") or [])[:4]:
+    for i, dd in enumerate((data.get("predict") or {}).get("detail") or []):
+        if i >= 4:
+            break
         day = dd.get("day", {}).get("weather", {}) or {}
         night = dd.get("night", {}).get("weather", {}) or {}
         info = _cond(day.get("info"))
         ninfo = _cond(night.get("info"))
         if ninfo and ninfo != info:
             info = (info + "转" + ninfo) if info else ninfo
+        tmax = _temp(day.get("temperature"))
+        # NMC 对"当日"预报气温常返回缺测哨兵 9999，此时以实况气温近似当日最高温，
+        # 避免"今日最高/今日区卡"整列显示为 "-"。
+        if i == 0 and tmax is None:
+            tmax = _temp(weat.get("temperature"))
         days.append({
             "date": dd.get("date", ""),
             "info": info or "-",
-            "tmax": _temp(day.get("temperature")),
+            "tmax": tmax,
             "tmin": _temp(night.get("temperature")),
             "precip": _precip(dd.get("precipitation")),
         })
@@ -864,11 +871,14 @@ LIVE_FORECAST_JS = r"""<script>
   function rt(v){v=Number(v);return(!isNaN(v)&&Math.abs(v)<=60)?Math.round(v):null;}
   function precOf(v){v=Number(v);return(!isNaN(v)&&v>=0&&v<=800&&v!==9999)?v:0;}
   function cleanInfo(s){s=String(s||'').trim();return(s==='9999'||s==='999'||s==='0'||s==='-'||s==='')?'':s;}
-  function dayOf(dd){
+  function dayOf(dd,fbT){
     var d=(dd&&dd.day&&dd.day.weather)||{}, n=(dd&&dd.night&&dd.night.weather)||{};
     var info=cleanInfo(d.info), ninfo=cleanInfo(n.info);
     if(ninfo&&ninfo!==info){info=info?info+'转'+ninfo:ninfo;}
-    return{info:info||'-',tmax:rt(d.temperature),tmin:rt(n.temperature),prec:precOf(dd&&dd.precipitation)};
+    var tmax=rt(d.temperature);
+    /* 当日预报气温常为缺测哨兵(9999)，以实况气温近似当日最高温，避免整列 "-" */
+    if(tmax==null&&fbT!=null)tmax=fbT;
+    return{info:info||'-',tmax:tmax,tmin:rt(n.temperature),prec:precOf(dd&&dd.precipitation)};
   }
   function fmtT(v){return(v==null)?'-':v+'°';}
   function barW(p){return Math.min(100,Math.max(3,Math.round((p||0)/60*100)));}
@@ -909,7 +919,8 @@ LIVE_FORECAST_JS = r"""<script>
         .then(function(r){return r.json();})
         .then(function(d){
           var det=((d&&d.data&&d.data.predict)||{}).detail||[];
-          if(det[0]&&det[0].day)news[nm]={d0:dayOf(det[0]),d1:dayOf(det[1]||det[0])};
+          var fb=rt((((d&&d.data&&d.data.real)||{}).weather||{}).temperature);
+          if(det[0]&&det[0].day)news[nm]={d0:dayOf(det[0],fb),d1:dayOf(det[1]||det[0],fb)};
         }).catch(function(){})
         .then(function(){done++;next();});
     })();
