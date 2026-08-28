@@ -800,15 +800,15 @@ MAP_CARD = """<div class="card"><h2><span class="no">6</span>川渝全站点实�
 .share-btn{border:1px solid #c7d5e2;background:#fff;color:#12395b;font-size:12.5px;font-weight:600;border-radius:20px;
   padding:6px 14px;cursor:pointer;transition:.15s;box-shadow:0 1px 3px rgba(18,45,80,.08)}
 .share-btn:hover{background:#ecf3fb;border-color:#9db9d4}
-#shareOverlay{position:fixed;inset:0;background:rgba(15,28,46,.55);z-index:99999;display:none;
-  align-items:center;justify-content:center;padding:20px}
-.share-box{background:#fff;border-radius:14px;box-shadow:0 18px 60px rgba(0,0,0,.35);max-width:92vw;max-height:92vh;
-  display:flex;flex-direction:column;overflow:hidden}
-.share-head{display:flex;align-items:center;justify-content:space-between;padding:11px 16px;border-bottom:1px solid #e8eef4}
-.share-head b{color:#12395b;font-size:15px}
-.share-head button{background:none;border:none;font-size:22px;line-height:1;color:#7b8ca0;cursor:pointer;padding:0 4px}
-.share-body{flex:1;overflow:auto;display:flex;background:#eef2f6}
-.share-body img{display:block;max-width:100%;height:auto;margin:auto}
+#shareOverlay{position:fixed;top:0;left:0;right:0;bottom:0;z-index:99999;display:none;
+  align-items:center;justify-content:center;padding:20px;background:rgba(15,28,46,.55);
+  box-sizing:border-box;overflow:auto}
+.share-box{box-sizing:border-box;background:#fff;border-radius:14px;box-shadow:0 18px 60px rgba(0,0,0,.35);
+  max-width:min(92vw,1200px);max-height:calc(92vh - 30px);display:flex;flex-direction:column;
+  overflow:hidden;margin:auto}
+.share-head{display:flex;align-items:center;justify-content:space-between;padding:11px 16px;border-bottom:1px solid #e8eef4;flex:0 0 auto}
+.share-body{flex:1;min-height:0;overflow:auto;display:flex;background:#eef2f6}
+.share-body img{display:block;max-width:100%;max-height:calc(86vh - 150px);height:auto;object-fit:contain;margin:auto}
 .share-foot{display:flex;gap:10px;justify-content:center;padding:12px 16px;border-top:1px solid #e8eef4}
 .share-foot button{border:none;border-radius:20px;padding:8px 22px;font-size:14px;font-weight:700;cursor:pointer}
 .share-foot .dl{background:#12395b;color:#fff}
