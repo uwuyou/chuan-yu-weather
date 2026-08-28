@@ -530,6 +530,22 @@ def _dl_chart(url, path, max_w=860, q=68):
         return path
 
 
+def _compress_jpg(data, max_w=900, q=72):
+    """内存中降采样+压缩 JPEG（用于内嵌n多张小图时减小HTML体积）；无PIL则原样返回"""
+    try:
+        from PIL import Image
+        import io
+        im = Image.open(io.BytesIO(data)).convert("RGB")
+        w, h = im.size
+        if w > max_w:
+            im = im.resize((max_w, int(h * max_w / w)), Image.LANCZOS)
+        buf = io.BytesIO()
+        im.save(buf, "JPEG", quality=q, optimize=True)
+        return buf.getvalue()
+    except Exception:
+        return data
+
+
 def fetch_nmc_charts(out_dir):
     """抓取 NMC 官方预报图：降水量预报(24h/48h/72h) + FY4B 卫星云图。
     返回 {label: path}，全部失败返回 {}；异常均吞掉以便降级。"""
@@ -2210,6 +2226,7 @@ def build_multilevel():
             data = http_get(u, timeout=18)
             if not data or len(data) < 3000:
                 return None
+            data = _compress_jpg(data, 900, 72)
             return (i, short, lbl, tm, base64.b64encode(data).decode())
         except Exception:
             return None
@@ -2227,8 +2244,11 @@ def build_multilevel():
         i, short, lbl, tm, b64 = r
         act = " active" if i == 0 else ""
         tabs += "<button class='ml-tab%s' data-lv='%d'>%s</button>" % (act, i, short)
-        panes += ("<div class='ml-pane%s' data-lv='%d'><img src='data:image/jpeg;base64,%s'/>"
-                  "<div class='ml-cap'>%s · 北京时 %s</div></div>") % (act, i, b64, lbl, tm)
+        src_attr = "src='data:image/jpeg;base64,%s'" % b64
+        if i != 0:
+            src_attr = "data-src='data:image/jpeg;base64,%s'" % b64
+        panes += ("<div class='ml-pane%s' data-lv='%d'><img %s loading='lazy' decoding='async'/>"
+                  "<div class='ml-cap'>%s · 北京时 %s</div></div>") % (act, i, src_attr, lbl, tm)
         cap_ok += 1
     figs = ("<div class='ml-tabs'>%s</div><div class='ml-view'>%s</div>" % (tabs, panes)) if cap_ok else ""
 
@@ -2392,7 +2412,8 @@ __MLREAD____MLFIGS__
 .ml-cap{font-size:12px;color:#7b8ca0;padding:6px 2px 2px;text-align:center}
 </style>
 <script>(function(){var c=document.getElementById('mlcard');if(!c)return;var b=c.querySelectorAll('.ml-tab'),p=c.querySelectorAll('.ml-pane');
-for(var i=0;i<b.length;i++)b[i].onclick=(function(btn){return function(){var lv=btn.getAttribute('data-lv');for(var j=0;j<b.length;j++)b[j].classList.toggle('active',b[j]===btn);for(var j=0;j<p.length;j++)p[j].classList.toggle('active',p[j].getAttribute('data-lv')===lv);};})(b[i]);})();</script>
+function sel(btn){var i=btn.getAttribute('data-lv');for(var j=0;j<b.length;j++)b[j].classList.toggle('active',b[j]===btn);for(var j=0;j<p.length;j++){var on=(p[j].getAttribute('data-lv')===i);p[j].classList.toggle('active',on);if(on){var im=p[j].querySelector('img');if(im&&!im.getAttribute('src')&&im.getAttribute('data-src')){im.setAttribute('src',im.getAttribute('data-src'));im.removeAttribute('loading');}}}}
+for(var i=0;i<b.length;i++)b[i].onclick=(function(btn){return function(){sel(btn);};})(b[i]);})();</script>
 </div>""".replace("__MLREAD__", read_html).replace("__MLFIGS__", figs)
 
 
