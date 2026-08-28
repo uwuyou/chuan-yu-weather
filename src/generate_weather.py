@@ -688,6 +688,7 @@ MAP_CARD = """<div class="card"><h2><span class="no">6</span>川渝全站点实�
 .heat-legend .hl{display:inline-flex;align-items:center;gap:5px;margin:0 8px 4px 0}
 .heat-legend .hl i{width:11px;height:11px;border-radius:50%;display:inline-block;border:1px solid rgba(0,0,0,.12)}
 .layer-note{font-size:11.5px;color:#7b8ca0;margin-top:6px}
+.live-stat{color:var(--accent);font-weight:600}
 </style>
 <div id="heatmax"></div>
 <div class="heat-legend"><b>实况气温分级（℃）</b>
@@ -697,7 +698,7 @@ MAP_CARD = """<div class="card"><h2><span class="no">6</span>川渝全站点实�
 <span class="hl"><i style="background:#58b3e0"></i>25–29.9</span>
 <span class="hl"><i style="background:#3a79c2"></i>&lt;25</span>
 <span class="hl"><i style="background:#8aa0b5"></i>缺测</span></div>
-<div class="layer-note">底图：高德（无需代理）· 小圆点=川渝各站点实时实况（逐点拉取 NMC 实况着色，页面加载与每 10 分钟自动刷新）· 大圆=七分区代表城区今日预报最高温。</div>
+<div class="layer-note">底图：高德（无需代理）· 小圆点=川渝各站点实时实况（逐点拉取 NMC 实况着色）· 大圆=七分区代表城区今日预报最高温。 <span class="live-stat" id="liveStat">实况更新中…</span></div>
 <script src="https://cdn.staticfile.org/leaflet/1.9.4/leaflet.min.js"></script>
 <script>
 (function(){
@@ -738,34 +739,33 @@ MAP_CARD = """<div class="card"><h2><span class="no">6</span>川渝全站点实�
   L.control.layers({'高德路网':road,'高德卫星':sat},
     {'代表城区(今日预报最高)':repLayer,'川渝全站点(实时实况)':liveLayer}, {collapsed:false}).addTo(map);
 
-  /* 实时实况：NMC 逐站拉取，并发受控，逐个着色 */
+  /* 实时实况：NMC 逐站拉取，并发受控，逐个着色（简单 GET 免预检跨域） */
   function pad(n){return (n<10?'0':'')+n;}
+  var statEl=document.getElementById('liveStat');
   function refresh(){
-    var qi=0, tasks=STATIONS.slice();
+    var qi=0, done=0, tasks=STATIONS.slice(), ok=0;
     function pump(){
-      while(qi<tasks.length){
-        var i=qi; qi++;
-        (function(i){
-          var s=tasks[i], mk=live[i];
-          fetch('https://www.nmc.cn/rest/weather?stationid='+s.code,{headers:{'X-Requested-With':'fetch'}})
-            .then(function(r){return r.json();})
-            .then(function(d){
-              var real=(d&&d.data&&d.data.real)||{}, wea=real.weather||{};
-              var T=wea.temperature;
-              if(mk && T!=null && !isNaN(T) && Math.abs(T)<=60){
-                mk.setStyle({fillColor:colorOf(T),radius:radOf(T)});
-                var pt=(real.publish_time||'').slice(11,16);
-                mk.setPopupContent('<b>'+s.city+'</b>（'+s.province+'）<br/>实况 <b style="color:#c23b2e">'+Math.round(T)+'℃</b>'+(wea.info?' · '+wea.info:'')+'<br/>发布 '+(pt||'—'));
-              }else if(mk){
-                mk.setPopupContent('<b>'+s.city+'</b>（'+s.province+'）<br/>实况暂缺（数据缺测）');
-              }
-            }).catch(function(){})
-            .then(function(){ pump(); });
-        })(i);
-        return;
-      }
+      if(qi>=tasks.length){ if(done>=tasks.length && statEl) statEl.textContent='已加载实况 '+ok+'/'+tasks.length; return; }
+      var i=qi; qi++;
+      (function(i){
+        var s=tasks[i], mk=live[i];
+        fetch('https://www.nmc.cn/rest/weather?stationid='+s.code)
+          .then(function(r){return r.json();})
+          .then(function(d){
+            var real=(d&&d.data&&d.data.real)||{}, wea=real.weather||{};
+            var T=wea.temperature;
+            if(mk && T!=null && !isNaN(T) && Math.abs(T)<=60){
+              mk.setStyle({fillColor:colorOf(T),radius:radOf(T)}); ok++;
+              var pt=(real.publish_time||'').slice(11,16);
+              mk.setPopupContent('<b>'+s.city+'</b>（'+s.province+'）<br/>实况 <b style="color:#c23b2e">'+Math.round(T)+'℃</b>'+(wea.info?' · '+wea.info:'')+'<br/>发布 '+(pt||'—'));
+            }else if(mk){
+              mk.setPopupContent('<b>'+s.city+'</b>（'+s.province+'）<br/>实况暂缺（数据缺测）');
+            }
+          }).catch(function(){})
+          .then(function(){ done++; if(statEl) statEl.textContent='实况 '+(done<tasks.length?'更新中 '+done+'/'+tasks.length:'加载完成 '+ok+'/'+tasks.length); pump(); });
+      })(i);
     }
-    for(var k=0;k<8;k++){
+    for(var k=0;k<6;k++){
       if(qi>=tasks.length) break;
       pump();
     }
@@ -821,7 +821,7 @@ LIVE_JS = r"""<script>
     cards.forEach(function(card){
       var code=CODES[card.getAttribute("data-city")];
       if(!code){remaining--;return;}
-      fetch("https://www.nmc.cn/rest/weather?stationid="+code,{headers:{"X-Requested-With":"fetch"}})
+      fetch("https://www.nmc.cn/rest/weather?stationid="+code)
         .then(function(r){return r.json();})
         .then(function(d){
           var real=(d&&d.data&&d.data.real)||{}, wea=real.weather||{}, wind=real.wind||{};
