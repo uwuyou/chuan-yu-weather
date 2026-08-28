@@ -1,15 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-川渝天气展望 · 自动生成器（weather-analyst 方法论版）
-========================================================
-数据源：中央气象台 NMC（实况 + 7日逐日预报），覆盖川渝七分区代表城市，运行时动态解析站点代码。
-分析框架：按 weather-analyst 技能——大尺度形势 → 分区实况 → 分区风险 → 演变趋势 → 关注提示。
-增强   ：Ventusky 多要素截图（可选）、LLM 文案润色（可选）。
+川渝天气展望 · 分析报告版自动生成器（weather-analyst 方法论）
+=============================================================
+数据源：中央气象台 NMC（实况 + 7日逐日预报），覆盖川渝七分区代表城市。
+分析框架：严格按 weather-analyst 技能 ——
+    ① 大尺度形势概览（副高/冷空气/水汽对盆地影响）
+    ② 双城实况
+    ③ 分区×逐日×多维风险评估（降雨/高温/强对流，含72h演变趋势）
+    ④ 重点天气过程
+    ⑤ 分区逐日总览
+    ⑥ 关注与提示
 
 用法：
     python3 src/generate_weather.py                 # 核心模式：纯官方数据，确定性出稿
-    python3 src/generate_weather.py --ventusky      # 开启 Ventusky 图层截图
+    python3 src/generate_weather.py --ventusky      # 开启 Ventusky 多要素截图
     python3 src/generate_weather.py --llm           # 开启 LLM 润色（需 OPENAI_API_KEY）
     python3 src/generate_weather.py --out <dir>     # 输出目录，默认 ./site
 """
@@ -20,7 +25,7 @@ UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 NMC_WEATHER = "http://www.nmc.cn/rest/weather?stationid={code}"
 NMC_CITYPAGE = "http://www.nmc.cn/publish/forecast/ASC/{pinyin}.html"
 
-# 川渝七分区（weather-analyst 区域框架）
+# 川渝七分区（weather-analyst 区域框架；axis 为"主导影响轴"，用于默认配色与排序）
 REGIONS = [
     {"name": "盆西",   "focus": "西部沿山强降雨、地形雨；地形增幅易触发局地暴雨", "axis": "rain", "cities": [("成都", "chengdu"), ("雅安", "yaan"), ("眉山", "meishan")]},
     {"name": "盆东",   "focus": "副高控制下持续高温，午后对流", "axis": "heat", "cities": [("重庆", None), ("广安", "guangan")]},
@@ -96,54 +101,99 @@ def _num(v):
         return None
 
 
-# ---------- 分区聚合 / 风险评分（透明启发式）----------
-def _max72(city, key):
-    vals = [d[key] for d in city["days"][:3] if d[key] is not None]
-    return max(vals) if vals else None
+# ---------- 分区聚合 / 多维风险引擎（透明白箱启发式）----------
+CONVEC_WORDS = ("雷", "阵雨", "中雨", "大雨", "暴雨", "强对流")
 
 
-def _today_day0(city):
-    return city["days"][0] if city["days"] else {}
+def _day_dim(city, i):
+    """单城单日三维风险：rp 降雨(0-3) / hp 高温(0-3) / cp 强对流(0-2)"""
+    d = city["days"][i] if i < len(city["days"]) else {}
+    p, t, info = d.get("precip"), d.get("tmax"), (d.get("info", "") or "")
+    rp = 0
+    if p is not None:
+        rp = 1 + (p >= 15) + (p >= 40)
+    hp = 0
+    if t is not None:
+        hp = 1 + (t >= 35) + (t >= 37)
+    # 强对流：强雷雨显式词 / 高温下的大降水(午后热对流) / 大降水+降雨词
+    cp = 2 if "雷" in info else (1 if any(w in info for w in ("阵雨", "中雨", "大雨", "暴雨", "强对流")) else 0)
+    if p is not None and p >= 15 and t is not None and t >= 30:
+        cp = max(cp, 1)
+    if p is not None and p >= 40 and any(w in info for w in CONVEC_WORDS):
+        cp = max(cp, 2)
+    return {"rp": min(rp, 3), "hp": min(hp, 3), "cp": min(cp, 2),
+            "info": info or "-", "precip": p, "tmax": t,
+            "tmin": d.get("tmin"), "date": d.get("date", "")}
 
 
-def score_region(cities):
-    """据官方数据给区域打分：rain_points(0-3) / heat_points(0-3)"""
-    rp, hp = 0, 0
-    for c in cities:
-        mxp = _max72(c, "precip"); mxt = _max72(c, "tmax")
-        if mxp is not None:
-            rp = max(rp, 1 + (mxp >= 15) + (mxp >= 40))
-        if mxt is not None:
-            hp = max(hp, 1 + (mxt >= 35) + (mxt >= 37))
-    return min(rp, 3), min(hp, 3)
+def region_analysis(cities):
+    """分区×逐日(0-2)聚合 + 72h峰值 + 演变趋势"""
+    days = []
+    for i in range(3):
+        r = h = c = 0
+        for city in cities:
+            dm = _day_dim(city, i)
+            r = max(r, dm["rp"]); h = max(h, dm["hp"]); c = max(c, dm["cp"])
+        days.append([r, h, c])
+    r72 = max(d[0] for d in days); h72 = max(d[1] for d in days); c72 = max(d[2] for d in days)
+
+    def _s(d):
+        return max(d[0], d[1])
+    # 趋势：粗细用 dot 表示，箭头方向表示增强/减弱
+    s0, s1, s2 = (_s(days[0]), _s(days[1]), _s(days[2]))
+    if s1 > s0:
+        trend, trend_dir = "增强（明日风险抬升）", "↑"
+    elif s1 < s0:
+        trend, trend_dir = "减弱（今日为峰值）", "↓"
+    else:
+        trend_dir = "→"
+        trend = "平稳（维持相同量级）"
+    rpeaks = [i for i in range(3) if days[i][0] == r72 and r72]
+    tpeaks = [i for i in range(3) if days[i][1] == h72 and h72]
+    daynames = {0: "今", 1: "明", 2: "后"}
+    r_peak = ("，降雨峰值在" + "、".join(daynames[i] for i in rpeaks)) if r72 else ""
+    t_peak = ("，高温峰值在" + "、".join(daynames[i] for i in tpeaks)) if h72 else ""
+    return {"days": days, "rp": r72, "hp": h72, "cp": c72,
+            "s0": s0, "s1": s1, "s2": s2, "trend": trend, "trend_dir": trend_dir,
+            "r_peak": r_peak, "t_peak": t_peak}
 
 
-def region_risk(axis, cities):
-    rp, hp = score_region(cities)
+def region_risk(axis, analysis):
+    """由三维风险合成区域定级。返回 dict：level / axis_label / dims / tip"""
+    rp, hp, cp = analysis["rp"], analysis["hp"], analysis["cp"]
+    dims = []
+    if rp: dims.append(("降雨", rp, _lvl(rp)))
+    if hp: dims.append(("高温", hp, _lvl(hp)))
+    if cp: dims.append(("强对流", cp, _lvl(cp)))
+    if not dims:
+        dims = [("晴稳", 0, "关注")]
+    # 主导轴定级：用"该轴分数"决定色彩，其余维度作补充
     if axis == "heat":
-        level, icon, tip = _band(hp, "高温", "防暑降温，谨防中暑")
+        score = hp
     elif axis == "rain":
-        level, icon, tip = _band(rp, "降雨", "防范山洪与地质灾害滞后风险")
+        score = rp
     else:
         score = max(rp, hp)
-        kind = "高温" if (hp >= rp and hp) else ("降雨" if rp else "晴稳")
-        level, icon, tip = _band(score, kind, "关注午后对流与晴雨转换")
-    return {"risk": level, "axis": icon, "tip": tip, "rp": rp, "hp": hp}
-
-
-def _band(score, kind, tip):
+    score = max(score, cp if cp >= 2 else 0)
     if score >= 3:
-        return ("高", kind, tip)
-    if score >= 2:
-        return ("中", kind, tip)
-    if score >= 1:
-        return ("较低", kind, tip)
-    return ("关注", "晴稳", "天气相对平稳，随观随报")
+        level = "高"
+    elif score >= 2:
+        level = "中"
+    elif score >= 1:
+        level = "较低"
+    else:
+        level = "关注"
+    tip = {3: "重点关注：防范强降雨/高温叠加影响，减少非必要户外活动",
+           2: "需防范局地强降雨或高温，留意趋势变化",
+           1: "量级较低，随观随报，关注午后对流"} .get(max(score, 0), "天气相对平稳，随观随报")
+    if cp >= 2:
+        tip = "警惕午后局地强对流（雷暴大风/短时强降水）与地质灾害滞后效应"
+    return {"level": level, "score": score, "dims": dims, "tip": tip,
+            "rp": rp, "hp": hp, "cp": cp}
 
 
-def build_report(fetched):
-    """fetched: dict cityname -> city. 返回标题/分区/概览等数据由 render 消费亦可在此组装"""
-    return fetched
+def _lvl(score):
+    return {3: "高", 2: "中", 1: "较低", 0: "关注"}.get(score, "关注")
 
 
 # ---------- Ventusky 截图（可选）----------
@@ -210,132 +260,326 @@ def llm_summary(data):
 
 # ---------- 渲染 ----------
 CSS = """
-:root{--bg:#eef4fb;--card:#fff;--navy:#16324f;--line:#e3edf7;--accent:#2f7cb6;
-  --amber:#b26a00;--red:#c0392b;--orange:#c26a12;--yellow:#9a7d0a;--green:#2a8a3e;}
+:root{--bg:#eef3f9;--card:#fff;--navy:#14324f;--navy2:#2a5b8c;--ink:#24313d;
+  --line:#e3ecf5;--accent:#2f7cb6;--muted:#7b8ca0;
+  --red:#c23b2e;--orange:#c26a12;--amber:#9a7d0a;--green:#2a8a3e;--soft:#5c93c2}
 *{box-sizing:border-box}
-body{margin:0;background:linear-gradient(180deg,#e9f1fa,#eef4fb);color:#26333f;
-  font-family:"Noto Sans CJK SC","PingFang SC","Microsoft YaHei",sans-serif;line-height:1.75}
-.wrap{max-width:1000px;margin:0 auto;padding:32px 18px 30px}
-.hero{background:linear-gradient(135deg,#16324f,#2f5d8a);color:#fff;border-radius:18px;
-  padding:26px 28px;margin-bottom:20px;box-shadow:0 8px 24px rgba(22,50,79,.25)}
-.hero h1{margin:0 0 6px;font-size:27px;letter-spacing:.5px}
-.hero .sub{color:#cfe0f2;font-size:13.5px}
-.hero .meta{margin-top:12px;font-size:12.5px;color:#9fbcd6}
-.card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:20px 22px;margin:18px 0;
-  box-shadow:0 2px 6px rgba(22,50,79,.06)}
-.card h2{margin:0 0 14px;font-size:17px;color:var(--navy);display:flex;align-items:center;gap:10px}
-.card h2 .no{background:var(--navy);color:#fff;font-size:13px;border-radius:8px;
-  width:24px;height:24px;display:inline-flex;align-items:center;justify-content:center;flex:none}
-.sec-sub{color:#8aa0b5;font-size:12.5px;margin:-8px 0 6px}
-.now{display:flex;flex-wrap:wrap;gap:12px}
-.city{flex:1 1 280px;background:#f5f9fe;border:1px solid var(--line);border-radius:12px;padding:12px 14px}
-.city .nm{font-size:14px;color:var(--navy);font-weight:700}
-.city .tg{font-size:22px;color:var(--navy);font-weight:700;margin:2px 0}
-.city .dt{font-size:12.5px;color:#667}
-table{width:100%;border-collapse:collapse;font-size:13px}
-th,td{border-bottom:1px solid var(--line);padding:8px 7px;text-align:center}
-th{color:#7c8ca1;font-weight:600;font-size:12px}
-th:first-child,td:first-child{text-align:left}
-.region{display:grid;gap:12px}
-.rrow{display:flex;gap:14px;align-items:flex-start;border:1px solid var(--line);border-radius:12px;
-  padding:12px 14px;background:#fbfdff}
-.rlvl{width:64px;text-align:center;flex:none}
-.pill{display:inline-block;padding:4px 10px;border-radius:20px;font-size:12px;font-weight:700;color:#fff}
-.p-高{background:var(--red)}.p-中{background:var(--orange)}.p-较低{background:var(--yellow)}.p-关注{background:#7f95a8}
-.rbody{flex:1}
-.rbody b{color:var(--navy)}
-.met{font-size:12px;color:#7c8ca1;margin-top:4px}
-.grade{border-radius:6px;padding:1px 7px;font-size:11.5px;margin-left:6px}
-.g-高{background:#c0392b20}.g-中{background:#c26a1218}.g-较低{background:#9a7d0a14}.g-关注{background:#7f95a814}
-.note{background:#fff8ea;border:1px solid #f0dca8;color:#7a5b12;border-radius:10px;padding:10px 14px;font-size:12.5px;margin-top:12px}
-.ep{background:#f1f6fb;border-radius:10px;padding:12px 15px;font-size:13.5px;color:#31506e;white-space:pre-wrap}
+body{margin:0;background:var(--bg);color:var(--ink);
+  font-family:"Noto Sans CJK SC","PingFang SC","Microsoft YaHei",sans-serif;
+  line-height:1.75;-webkit-font-smoothing:antialiased}
+.wrap{max-width:1020px;margin:0 auto;padding:34px 18px 32px}
+a{color:var(--accent);text-decoration:none}
+
+/* Hero */
+.hero{position:relative;overflow:hidden;border-radius:20px;padding:30px 32px;margin-bottom:22px;
+  background:radial-gradient(120% 160% at 8% 0%,#2b6b9d 0%,#1c4a75 45%,#14324f 100%);
+  color:#fff;box-shadow:0 12px 34px rgba(20,50,79,.28)}
+.hero::after{content:"";position:absolute;right:-60px;top:-60px;width:240px;height:240px;
+  border-radius:50%;background:radial-gradient(circle,rgba(255,255,255,.14),transparent 65%)}
+.hero .kicker{display:inline-block;font-size:12px;letter-spacing:2px;color:#bcd7ef;
+  text-transform:uppercase;margin-bottom:8px;background:rgba(255,255,255,.08);
+  padding:3px 10px;border-radius:20px}
+.hero h1{margin:0 0 8px;font-size:29px;letter-spacing:.5px;line-height:1.3}
+.hero .sub{color:#cde0f2;font-size:14px;max-width:640px}
+.hero .meta{display:flex;flex-wrap:wrap;gap:8px 18px;margin-top:16px;font-size:12.3px;color:#9dbcd9}
+.hero .meta b{color:#dcebf8;font-weight:600}
+
+/* Section / card */
+.card{background:var(--card);border:1px solid var(--line);border-radius:16px;
+  padding:22px 24px;margin:18px 0;box-shadow:0 2px 8px rgba(20,50,79,.05)}
+.card h2{display:flex;align-items:center;gap:11px;margin:0 0 6px;font-size:18px;color:var(--navy)}
+.card h2 .no{flex:none;width:28px;height:28px;border-radius:9px;background:linear-gradient(135deg,var(--navy),var(--navy2));
+  color:#fff;font-size:14px;display:inline-flex;align-items:center;justify-content:center;font-weight:700}
+.sec-sub{color:var(--muted);font-size:12.6px;margin:-2px 0 14px}
+
+/* Overview narrative */
+.syn{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:14px}
+.syn .chunk{background:linear-gradient(180deg,#f5f9fe,#f9fcfd);border:1px solid var(--line);
+  border-radius:12px;padding:14px 16px}
+.syn .chunk b{display:block;color:var(--navy);margin-bottom:4px;font-size:14px}
+.syn .chunk p{margin:0;font-size:13.4px;color:#41556a}
+.chip-tag{display:inline-block;background:var(--accent);color:#fff;font-size:10.5px;font-weight:700;
+  border-radius:6px;padding:1px 7px;vertical-align:2px;margin-left:6px}
+
+/* now */
+.now{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px}
+.city{background:linear-gradient(180deg,#f5f9fe,#fbfdfe);border:1px solid var(--line);
+  border-radius:13px;padding:13px 15px}
+.city .top{display:flex;justify-content:space-between;align-items:center;margin-bottom:2px}
+.city .nm{font-size:14.5px;color:var(--navy);font-weight:700}
+.city .flag{font-size:10.5px;color:var(--muted);border:1px solid var(--line);border-radius:6px;padding:0 6px}
+.city .tg{font-size:27px;color:var(--navy);font-weight:800;line-height:1.15}
+.city .tg small{font-size:13px;color:var(--muted);font-weight:600}
+.city .dt{font-size:12.3px;color:#60758a;margin-top:5px;line-height:1.6}
+.city .dt b{color:var(--navy)}
+
+/* Region risk */
+.regions{display:flex;flex-direction:column;gap:14px}
+.reg{border:1px solid var(--line);border-radius:14px;overflow:hidden;background:#fbfdff}
+.reg-head{display:flex;align-items:center;gap:14px;padding:12px 16px;flex-wrap:wrap;
+  background:linear-gradient(180deg,#f4f8fc,#f8fbfd);border-bottom:1px solid var(--line)}
+.reg-head .rname{font-size:16px;font-weight:800;color:var(--navy);letter-spacing:.3px}
+.reg-head .rweek{font-size:11.5px;color:var(--muted)}
+.pill{display:inline-flex;align-items:center;gap:5px;border-radius:20px;padding:4px 12px;font-size:12.6px;
+  font-weight:800;color:#fff;box-shadow:0 2px 6px rgba(20,50,79,.12)}
+.p-高{background:linear-gradient(135deg,#d64537,#c23b2e)}
+.p-中{background:linear-gradient(135deg,#e2853a,#c26a12)}
+.p-较低{background:linear-gradient(135deg,#cdb04a,#9a7d0a)}
+.p-关注{background:linear-gradient(135deg,#9db2c4,#7b8ca0)}
+.gauge{flex:1;min-width:150px}
+.gauge .cap{display:flex;justify-content:space-between;font-size:10.8px;color:var(--muted);
+  letter-spacing:.5px;margin-bottom:3px}
+.track{height:7px;border-radius:4px;background:#e6eef6;overflow:hidden}
+.fill{height:100%;border-radius:4px;background:linear-gradient(90deg,#5c93c2,#2f7cb6)}
+.reg-body{padding:12px 16px 14px}
+.dims{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:10px}
+.dim-node{display:flex;align-items:center;gap:6px;font-size:12.2px;border:1px solid var(--line);
+  border-radius:20px;padding:3px 10px;background:#fff}
+.dim-node .dot{width:8px;height:8px;border-radius:50%}
+.d-dot-0{background:#c8d4e0}.d-dot-1{background:#cdb04a}.d-dot-2{background:#e2853a}.d-dot-3{background:#d64537}
+.trendline{display:flex;align-items:center;gap:6px;font-size:12px;color:#41556a;margin-bottom:12px}
+.trendline .tlab{color:var(--muted)}
+.spark{display:inline-flex}
+.spark i{width:11px;height:11px;border-radius:3px;background:#c8d4e0;display:inline-block}
+.spark i.on{background:#c23b2e}.spark i.part{background:#e2853a}
+.spark i+.arrow{color:#9db2c4;margin:0 4px;font-weight:700}
+.cities{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:10px}
+.crow{border:1px solid var(--line);border-radius:11px;padding:9px 12px;background:#fff}
+.crow .cn{font-size:13px;font-weight:700;color:var(--navy);display:flex;justify-content:space-between;align-items:center}
+.crow .cn .cb{font-size:10.5px;font-weight:800;border-radius:6px;padding:1px 6px}
+.crow .today{font-size:12.2px;color:#41556a;margin-top:4px}
+.crow .today b{color:var(--navy)}
+.crow .pbar{height:5px;border-radius:3px;background:#e6eef6;margin-top:6px;overflow:hidden}
+.crow .pbar i{display:block;height:100%;background:linear-gradient(90deg,#7ac1e8,#2f7cb6)}
+.reg-tip{margin-top:12px;font-size:12.6px;color:#6a3f12;background:#fff8ea;border:1px dashed #e6cf96;
+  border-radius:10px;padding:8px 12px}
+
+/* Weather processes */
+.proc{list-style:none;margin:0;padding:0}
+.proc li{position:relative;padding:9px 0 9px 26px;border-bottom:1px dashed var(--line);font-size:13.4px}
+.proc li:last-child{border-bottom:0}
+.proc li::before{content:"";position:absolute;left:6px;top:16px;width:8px;height:8px;border-radius:50%;
+  background:var(--accent)}
+.proc li.warn::before{background:var(--red)}
+.proc li b{color:var(--navy)}
+
+/* table */
+table{width:100%;border-collapse:collapse;font-size:12.8px}
+th,td{border-bottom:1px solid var(--line);padding:8px 6px;text-align:center}
+th{color:var(--muted);font-weight:600;font-size:11.6px;letter-spacing:.3px}
+th:first-child,td:first-child,th:nth-child(2),td:nth-child(2){text-align:left}
+.wbar{display:inline-block;min-width:44px;height:6px;border-radius:3px;background:#e6eef6;position:relative;vertical-align:middle;margin-left:4px}
+.wbar i{position:absolute;left:0;top:0;bottom:0;border-radius:3px;background:linear-gradient(90deg,#7ac1e8,#2f7cb6)}
+
+/* ventusky grid */
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:12px}
-.grid figure{margin:0;border:1px solid var(--line);border-radius:10px;overflow:hidden;background:#fff}
+.grid figure{margin:0;border:1px solid var(--line);border-radius:12px;overflow:hidden;background:#fff}
 .grid img{width:100%;display:block;aspect-ratio:16/10;object-fit:cover}
-.grid figcaption{font-size:12px;color:#667;padding:6px 10px}
-.badges{display:flex;flex-wrap:wrap;gap:14px;margin-top:14px}
-.badges .b{background:#f2f7fd;border:1px solid var(--line);border-radius:10px;padding:9px 13px;font-size:12.8px}
-.badges .b b{color:var(--navy)}
-.foot{font-size:11.5px;color:#8697aa;margin-top:24px;text-align:center;line-height:1.8}
-b{color:var(--navy)}
-.hl{color:var(--red);font-weight:700}
-.up{color:#2a8a3e;font-weight:700}
+.grid figcaption{font-size:12px;color:#5c6b7c;padding:7px 11px}
+
+/* notes & focus */
+.foc{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:10px}
+.foc .f{background:#f2f7fb;border:1px solid var(--line);border-radius:11px;padding:10px 13px;
+  font-size:12.8px;color:#3b4f62}
+.foc .f b{color:var(--navy);display:block;margin-bottom:2px}
+.foc .f.red{background:#fdf1ef;border-color:#f0c6be;color:#6d2f26}
+.foc .f.red b{color:#a63a2b}
+.ep{background:linear-gradient(180deg,#f4f8fc,#fafcfe);border:1px solid var(--line);border-radius:12px;
+  padding:12px 15px;font-size:13.6px;color:#31506e;white-space:pre-wrap}
+.note{background:#fff8ea;border:1px solid #f0dca8;color:#7a5b12;border-radius:10px;padding:10px 14px;
+  font-size:12.3px;margin-top:14px}
+.foot{font-size:11.6px;color:#8697aa;margin-top:26px;text-align:center;line-height:1.8}
+b.strong{color:var(--navy)}
+.warn-t{color:var(--red);font-weight:700}
 """
 
 
 def esc(s):
-    if s is None:
-        return "-"
-    return str(s)
+    return "-" if s is None else str(s)
 
 
 def fmt_temp(v):
-    return ("%d" % v) if v is not None and not isinstance(v, str) else (esc(v) if v not in (None, "") else "-")
+    if v is None:
+        return "-"
+    if isinstance(v, str):
+        return v or "-"
+    try:
+        return "%d" % int(round(v))
+    except Exception:
+        return str(v)
 
 
+def _lvl_css(level):
+    return {"高": 3, "中": 2, "较低": 1, "关注": 0}.get(level, 0)
+
+
+def _clean_cond(v):
+    """把 NMC 的占位符 '-' 或空值归一化为空串"""
+    if v is None or str(v).strip() in ("", "-"):
+        return ""
+    return str(v).strip()
+
+
+# ---------- 渲染主函数 ----------
 def render(fetched, ventusky_paths, narr, site_dir, generated):
     ts = generated.strftime("%Y-%m-%d %H:%M")
     dstr = generated.strftime("%m月%d日")
     publish = next((c["publish"] for c in fetched.values() if c.get("publish")), "-")
 
     # ① 双城实况
-    nowchips = ""
+    now_cards = ""
     for key in ("成都", "重庆"):
         c = fetched.get(key)
         if not c:
             continue
-        nw = c.get("now_info", "") or "-"
-        wd = c.get("wind", "") or "-"
-        hd = c.get("humidity")
-        nowchips += ("<div class='city'><div class='nm'>{nm}</div><div class='tg'>{t}℃</div>"
-                     "<div class='dt'>{info} · {wind} · 湿度 {hum}% · 实况发布于 {pub}</div></div>").format(
-            nm=c["name"], t=fmt_temp(c.get("now_temp")), info=nw, wind=wd,
-            hum=(int(hd) if hd is not None else "-"), pub=(c.get("publish") or "-"))
+        now_cards += ("<div class='city'><div class='top'><span class='nm'>{nm}</span>"
+                      "<span class='flag'>实况 {pub}</span></div>"
+                      "<div class='tg'>{t}℃{tag}</div>"
+                      "<div class='dt'>{wind} · 湿度 {hum} · 今日 {today}</div></div>").format(
+            nm=c["name"], t=fmt_temp(c.get("now_temp")),
+            tag=("　<small>{info}</small>" % {"info": _clean_cond(c.get("now_info"))}) if _clean_cond(c.get("now_info")) else "",
+            pub=((c.get("publish") or "")[-5:] or "-"),
+            wind=(c.get("wind") or "-"), hum=((c.get("humidity") and "%d%%" % int(c["humidity"])) or "-"),
+            today=(c["days"][0]["info"] if c["days"] else "-"))
 
-    # ② 分区风险
-    regions_html = ""
+    # 形势总览：解析各分区强度用于文案
+    hot_names, rain_names = [], []
     for r in REGIONS:
         rc = [fetched[n] for n, _ in r["cities"] if n in fetched]
         if not rc:
             continue
-        risk = region_risk(r["axis"], rc)
-        deg = risk["risk"]
-        # 各代表城市一句
-        metro = []
+        an = region_analysis(rc)
+        if an["hp"] >= 2 and an["hp"] >= an["rp"]:
+            hot_names.append(r["name"])
+        if an["rp"] >= 2:
+            rain_names.append(r["name"])
+    syn_head = "本轮（未来3日）形势："
+    if hot_names and rain_names:
+        syn = ("盆地呈显著分区差异——%s以晴热高温为主，%s一带降雨相对活跃，需分区看待。"
+               "副高控制强度直接决定盆东至川南高温是否延续，低涡切变与地形抬升则构成西部沿山强降雨的背景。"
+               % ("、".join(hot_names), "、".join(rain_names)))
+    elif hot_names:
+        syn = "盆地及川南以副高控制下的晴热为主，%s为高温持续区，盆西气温相对温和。" % "、".join(hot_names)
+    elif rain_names:
+        syn = "区域内降雨系统活跃，%s为多雨重点区，其余地区天气相对平稳。" % "、".join(rain_names)
+    else:
+        syn = "本轮区域天气相对平稳，降水与极端高温均不显著，整体适宜户外活动与出行。"
+
+    # ② 分区风险
+    regions_html = ""
+    processes = []   # ③ 重点天气过程
+    focus = []       # 关注与提示
+    for r in REGIONS:
+        rc = [fetched[n] for n, _ in r["cities"] if n in fetched]
+        if not rc:
+            continue
+        an = region_analysis(rc)
+        risk = region_risk(r["axis"], an)
+        lvl = risk["level"]
+        # 逐日 spark
+        spark = ""
+        for i, dd in enumerate(an["days"]):
+            s = max(dd[0], dd[1])
+            cls = "on" if s >= 2 else ("part" if s == 1 else "")
+            lab = ("今:" if i == 0 else "明:" if i == 1 else "后:")
+            arrow = "→" if i == 0 else "→"
+            spark += ("<span class='spark'>{lab}<i class='{cls}'></i></span>").format(lab=lab, cls=cls)
+            if i < 2:
+                spark += "<span class='arrow'>→</span>"
+        # 维度节点
+        dimnodes = ""
+        for name, sc, dlab in risk["dims"]:
+            dimnodes += ("<span class='dim-node'><span class='dot d-dot-{s}'></span>{n} {l}</span>").format(
+                s=_lvl_css(dlab) if False else sc, n=name, l=dlab)
+        # 每城一日
+        crows = ""
         for c in rc:
             d0 = c["days"][0] if c["days"] else {}
-            metro.append("%s %s%s°/%s°·%.0fmm"
-                         % (c["name"], d0.get("info", "-"), fmt_temp(d0.get("tmax", "-")),
-                            fmt_temp(d0.get("tmin", "-")), d0.get("precip") or 0))
+            dm = _day_dim(c, 0)
+            pb = min(100, max(3, round(((d0.get("precip") or 0) / 60.0) * 100)))
+            cb, cbl = "cb", "关注"
+            if dm["rp"] >= 3 or dm["cp"] >= 2:
+                cb, cbl = "cb", "高"; ccls = "background:#c23b2e;color:#fff"
+            elif dm["rp"] >= 2 or dm["hp"] >= 2:
+                ccls = "background:#e2853a;color:#fff"; cbl = "中"
+            else:
+                ccls = "background:#c8d4e0;color:#3b4f62"
+            crows += ("<div class='crow'><div class='cn'>{nm}<span class='cb' style='{cls}'>{bl}</span></div>"
+                      "<div class='today'>{info} <b>{tmax}°</b>/<b>{tmin}°</b></div>"
+                      "<div class='pbar'><i style='width:{pb}%'></i></div></div>").format(
+                nm=c["name"], info=(d0.get("info") or "-"),
+                tmax=fmt_temp(d0.get("tmax")), tmin=fmt_temp(d0.get("tmin")),
+                pb=pb, cls=ccls, bl=cbl)
         cnames = "、".join(nm for nm, _ in r["cities"] if nm in fetched)
-        maxp = max((_max72(c, "precip") or 0) for c in rc)
-        maxt = max((_max72(c, "tmax") or 0) for c in rc)
-        met = "72h最大日降水约 %.0f mm · 72h最高温约 %d℃ · 代表站：%s" % (maxp, maxt, cnames)
-        grade = risk["axis"] if risk["risk"] in ("高", "中") else ("降雨" if risk["rp"] else "高温")
-        regions_html += (
-            "<div class='rrow'><div class='rlvl'><span class='pill p-{deg}'>{deg}</span>"
-            "<div style='font-size:11.5px;color:#7c8ca1;margin-top:6px'>{axis}</div></div>"
-            "<div class='rbody'><b>{name}</b> <span class='grade g-{deg}'>{axis}</span>"
-            "<div style='font-size:13px;margin-top:4px'>{metro}</div>"
-            "<div class='met'>关注：{focus} ｜ {met}</div>"
-            "<div style='font-size:12.8px;margin-top:6px'>{tip}</div></div></div>"
-        ).format(deg=deg, axis=risk["axis"], name=r["name"], metro="；".join(metro),
-                 focus=r["focus"], met=met, tip=risk["tip"])
+        # peak texts
+        maxt = max((_day_dim(c, i)["tmax"] or 0) for c in rc for i in range(3))
+        maxp = max((_day_dim(c, i)["precip"] or 0) for c in rc for i in range(3))
+        met = "72h最高温约 %d℃ · 72h最大单日降水约 %dmm · 代表站 %s" % (maxt, maxp, cnames)
+        regions_html += ("""
+<div class='reg'>
+  <div class='reg-head'>
+    <span class='rname'>{name}</span>
+    <span class='pill p-{lvl}'>{lvl}风险</span>
+    <div class='gauge'><div class='cap'><span>风险指数 {scr}/3</span><span>未来3日</span></div>
+      <div class='track'><div class='fill' style='width:{pct}%'></div></div></div>
+  </div>
+  <div class='reg-body'>
+    <div class='dims'>{dims}</div>
+    <div class='trendline'><span class='tlab'>演变</span>{spark}
+      <span class='arrow'>{dir}</span><span>{trend}</span></div>
+    <div class='cities'>{crows}</div>
+    <div class='met' style='color:{mc};font-size:12px;margin-top:10px'>{met}</div>
+    <div class='reg-tip'>关注：{focus}｜{tip}</div>
+  </div>
+</div>""").format(
+            name=r["name"], lvl=lvl, scr=risk["score"],
+            pct=min(100, 25 + risk["score"] * 25), dims=dimnodes,
+            spark=spark, dir=an["trend_dir"], trend=an["trend"], crows=crows,
+            focus=r["focus"], tip=risk["tip"], met=met, mc="#7b8ca0")
 
-    # ③ 总览表（16城）
+        # ③ 重点天气过程 + 关注
+        if lvl in ("高", "中"):
+            if risk["hp"] >= 2 and risk["hp"] >= risk["rp"]:
+                processes.append(("高", "%s：未来72小时最高温约 %d℃，持续晴热，注意防暑降温与午后对流" % (r["name"], maxt)))
+            elif risk["rp"] >= 2:
+                processes.append(("高", "%s：预报最大单日降水约 %dmm，防范局地强降雨、山洪与地质灾害滞后影响" % (r["name"], maxp)))
+            elif risk["cp"] >= 2:
+                processes.append(("中", "%s：午后局地强对流（雷阵雨/短时大风）活跃，注意出行安全" % r["name"]))
+            else:
+                processes.append(("中", "%s：天气有波动，晴雨转换频繁，关注午后阵性降水" % r["name"]))
+            if risk["hp"] >= 2:
+                focus.append(("red", "高温应对", "%s 最高温偏高，午后减少长时间户外活动，谨防中暑" % r["name"]))
+            if risk["rp"] >= 2:
+                focus.append(("red", "降雨与次生灾害", "%s 降雨明显，山区避免前往，留意山洪/滑坡滞后风险" % r["name"]))
+            if risk["cp"] >= 2:
+                focus.append(("norm", "强对流", "%s 午后对流活跃，雷雨时段减少露天活动" % r["name"]))
+    if not processes:
+        processes.append(("norm", "本轮区域天气整体平稳，无明显灾害性天气，随观随报，关注后续预报更新"))
+    proc_html = "".join("<li class='{w}'>{t}</li>".format(w=("warn" if w == "高" else ""), t=t)
+                        for w, t in processes)
+
+    # 关注与提示卡片
+    if not focus:
+        focus.append(("norm", "天气平稳", "区域无显著灾害性天气，正常生活与出行即可"))
+    foc_html = "".join("<div class='f {cl}'><b>{t}</b>{d}</div>".format(cl=cl, t=t, d=d) for cl, t, d in focus)
+
+    # ④ 分区逐日总览(16城)：今日 + 明日
     rows = ""
     for r in REGIONS:
         for nm, _ in r["cities"]:
             c = fetched.get(nm)
-            if not c:
+            if not c or not c["days"]:
                 continue
-            d0 = c["days"][1] if len(c["days"]) > 1 else c["days"][0] if c["days"] else {}
-            d1 = c["days"][2] if len(c["days"]) > 2 else d0
-            rows += "<tr><td>{r}</td><td>{nm}</td><td>{t0}</td><td>{d0}</td><td>{t1}</td><td>{d1}</td></tr>".format(
-                r=r["name"], nm=nm, t0=fmt_temp(c.get("now_temp")),
-                d0=("%s %.0fmm" % (d0.get("info", "-"), d0.get("precip") or 0)) if d0 else "-",
-                t1=fmt_temp(d1.get("tmax", "-")),
-                d1=("%s %.0fmm" % (d1.get("info", "-"), d1.get("precip") or 0)) if d1 else "-")
+            d0 = c["days"][0] if len(c["days"]) > 0 else {}
+            d1 = c["days"][1] if len(c["days"]) > 1 else d0
+            p0 = (d0.get("precip") or 0)
+            pb = min(100, round((p0 / 60.0) * 100))
+            rows += ("<tr><td>{r}</td><td><b>{nm}</b></td>"
+                     "<td>{t0}</td><td>{w0}<span class='wbar'><i style='width:{pb}%'></i></span></td>"
+                     "<td>{t1}</td><td>{w1}</td></tr>").format(
+                r=r["name"], nm=nm, t0=fmt_temp(d0.get("tmax")),
+                w0=(d0.get("info") or "-"), pb=pb,
+                t1=fmt_temp(d1.get("tmax")), w1=(d1.get("info") or "-"))
 
     # Ventusky
     vent = ""
@@ -347,7 +591,7 @@ def render(fetched, ventusky_paths, narr, site_dir, generated):
             mime = "image/jpeg" if p.lower().endswith((".jpg", ".jpeg")) else "image/png"
             blocks += ("<figure><img src='data:{m};base64,{b}'/><figcaption>{l}</figcaption></figure>").format(
                 m=mime, b=b64, l={"wind": "风场", "rain": "降水落区", "temperature": "气温", "pressure": "海平面气压"}.get(k, k))
-        vent = ("<div class='card'><h2><span class='no'>4</span>多要素实况解析（Ventusky 数值模式）</h2>"
+        vent = ("<div class='card'><h2><span class='no'>6</span>多要素实况解析（Ventusky 数值模式）</h2>"
                 "<div class='sec-sub'>同一时刻四要素 · 叠加地形与城市标注 · 与官方数据交叉印证</div>"
                 "<div class='grid'>{b}</div>"
                 "<div class='note'>实况要素面交叉印证，具体取值与结论以中央气象台及属地气象部门官方预报为准。</div></div>").format(b=blocks)
@@ -357,37 +601,55 @@ def render(fetched, ventusky_paths, narr, site_dir, generated):
     html = """<!DOCTYPE html>
 <html lang="zh">
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>川渝天气展望 · 分区风险解析 {d}</title><style>{css}</style></head>
+<title>川渝天气展望 · 分区风险分析报告 {d}</title><style>{css}</style></head>
 <body><div class="wrap">
 <div class="hero">
-<h1>川渝天气展望 · 夏季分区风险解析</h1>
-<div class="sub">雨带动态与盆西盆东温差 · 七分区逐轴风险评估</div>
-<div class="meta">数据源：中央气象台 NMC（官方实况+未来预报）｜ 分析：weather-analyst 范式 ｜ 生成：{gen}</div>
+  <span class="kicker">Sichuan &amp; Chongqing Weather Outlook</span>
+  <h1>川渝天气展望 · 分区风险分析报告</h1>
+  <div class="sub">基于中央气象台官方预报 · 七分区 × 降雨/高温/强对流三维风险 · 未来3日演变趋势</div>
+  <div class="meta"><span><b>报告日期</b> {d}</span><span><b>预报发布</b> {pub}</span>
+    <span><b>数据源</b> 中央气象台 NMC</span><span><b>分析范式</b> weather-analyst</span>
+    <span><b>生成时间</b> {gen}</span></div>
 </div>
 
-<div class="card"><h2><span class="no">1</span>双城官方实况</h2>
-<div class="sec-sub">发布于 {pub} · 实时观测</div><div class="now">{nowchips}</div></div>
+<div class="card"><h2><span class="no">1</span>形势概览</h2>
+<div class="sec-sub">自大尺度环流切入，先判"盆西水深 / 盆东火热"式的区域格局</div>
+<div class="syn"><div class="chunk"><b>环流判断</b><p>{syn}</p></div>
+<div class="chunk"><b>解读口径</b><p>本报告不生产新预报，仅对官方逐日预报做分区聚合与透明分级，
+  强对流/高温/强降雨的具体落区以属地气象台预警为准。</p></div></div></div>
 
-<div class="card"><h2><span class="no">2</span>分区天气与风险解析</h2>
-<div class="sec-sub">依官方预报聚合 · 风险按主导影响轴（降雨/高温）分级；高=需重点防范</div>
-<div class="region">{regions}</div>
-<div class="note">风险等级由各分区代表城市官方逐日预报中的<b>最大单日降水</b>与<b>72h最高气温</b>经透明规则综合评定；仅作形势研判，具体以属地气象台预警为准。</div></div>
+<div class="card"><h2><span class="no">2</span>双城官方实况</h2>
+<div class="sec-sub">成都 / 重庆 实时观测 · 发布于 {pub}</div><div class="now">{now_cards}</div></div>
 
-<div class="card"><h2><span class="no">3</span>分区实况总览（官方逐日预报）</h2>
-<div class="sec-sub">成都/重庆为实时观测，其余城市取官方未来预报</div>
-<table><thead><tr><th>分区</th><th>城市</th><th>实况/未来1日</th><th>逐日</th><th>未来最高</th><th>逐日</th></tr></thead>
+<div class="card"><h2><span class="no">3</span>分区天气与三维风险评估</h2>
+<div class="sec-sub">按分区 × 逐日聚合 · 风险合成降雨(0-3)/高温(0-3)/强对流(0-2) 三轴；高/中需重点防范</div>
+{regions_html}
+<div class="note">风险由各分区代表城市官方逐日预报中的最大单日降水、72h最高气温与雷雨对流信号经透明白箱规则综合评定；
+  仅作形势研判，灾害性天气请以属地气象台预警为准。</div></div>
+
+<div class="card"><h2><span class="no">4</span>重点天气过程</h2>
+<div class="sec-sub">由分区风险自动提炼的过程清单</div>
+<ul class="proc">{proc_html}</ul></div>
+
+<div class="card"><h2><span class="no">5</span>分区逐日预报总览（官方）</h2>
+<div class="sec-sub">今明两日逐日天气与最高温 · 柱条反映今日相对降水强度</div>
+<table><thead><tr><th>分区</th><th>城市</th><th>今日最高</th><th>今日天气</th><th>明日最高</th><th>明日天气</th></tr></thead>
 <tbody>{rows}</tbody></table></div>
 
 {vent}
 
-<div class="card"><h2><span class="no">5</span>形势解读与关注提示</h2>
+<div class="card"><h2><span class="no">7</span>关注与提示</h2>
+<div class="sec-sub">按分区风险生成，红标为首要关注</div>
+<div class="foc">{foc_html}</div>
 {narr_block}</div>
 
-<div class="foot">本页由 GitHub Actions 定时自动生成 · 数据来自中央气象台 NMC / Ventusky · 未经人工审核，仅供参考<br/>
+<div class="foot">本页由 GitHub Actions 定时自动生成 · 数据来自中央气象台 NMC{vent_note} · 未经人工审核，仅供参考<br/>
 灾害性天气请以属地气象部门发布的预报预警为准。</div>
 </div></body></html>""".format(
-        css=CSS, d=dstr, gen=ts, pub=publish, nowchips=nowchips, regions=regions_html,
-        rows=rows, vent=vent, narr_block=narr_block)
+        css=CSS, d=dstr, pub=publish, gen=ts, syn=syn, now_cards=now_cards,
+        regions_html=regions_html, rows=rows, proc_html=proc_html, foc_html=foc_html,
+        vent=vent, narr_block=narr_block,
+        vent_note=(" / Ventusky" if ventusky_paths else ""))
 
     os.makedirs(site_dir, exist_ok=True)
     out = os.path.join(site_dir, "index.html")
@@ -425,7 +687,7 @@ def main():
 
     narr = llm_summary(fetched) if args.llm else None
     if not narr:
-        narr = "今日数据已按分区聚合于上方表格。整体看：盆东及川南（重庆、广安、西昌、攀枝花）最高温偏高、需防暑；盆西、盆北、川东北沿山地区逐日降水较明显，注意局地强降雨与地质灾害滞后效应。高温/强降雨具体落区与强度以中央气象台及属地气象台实时预警为准。"
+        narr = "（未启用 LLM 润色，采用上方规则化形势概览与分区风险，数据取官方实时。）"
 
     render(fetched, vent, narr, args.out, datetime.now())
 
