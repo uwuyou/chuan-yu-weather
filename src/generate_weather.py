@@ -258,6 +258,85 @@ def llm_summary(data):
         return None
 
 
+# ---------- NMC 官方预报图 ----------
+NMC_PRECIP_PAGE = "http://www.nmc.cn/publish/precipitation/1-day.html"
+NMC_SAT_PAGE = "http://www.nmc.cn/publish/satellite.html"
+# 全国降水量预报：SEVP_NMC_STFC_SFER_ER24_ACHN_L88_P9_{basetime12}{lead5}.JPG
+_NMC_PRECIP_RE = re.compile(
+    r"image\.nmc\.cn/product/\d{4}/\d{2}/\d{2}/STFC/medium/"
+    r"SEVP_NMC_STFC_SFER_ER24_ACHN_L88_P9_(\d{12})(\d{5})\.JPG", re.I)
+# FY4B 卫星云图（亮度温度,中国区域）
+_NMC_SAT_RE = re.compile(
+    r"image\.nmc\.cn/product/\d{4}/\d{2}/\d{2}/WXBL/medium/"
+    r"SEVP_NSMC_WXBL_FY4B_ETCC_ACHN_LNO_PY_(\d{14})\.JPG", re.I)
+
+
+def _newest_by_lead(page_html, regex, leads):
+    """从产品页解析各时效(lead)最新基线下的预报图 URL 全量"""
+    best = {}
+    for m in regex.finditer(page_html):
+        base, lead = m.group(1), m.group(2)
+        if lead not in leads:
+            continue
+        cur = best.get(lead)
+        if cur is None or base > cur[0]:
+            best[lead] = "https://" + m.group(0)
+    return best
+
+
+def _dl_chart(url, path, max_w=860, q=68):
+    """下载官方图，并用 PIL 降采样压缩以便内嵌；无 PIL 则原样保存"""
+    data = http_get(url, timeout=30)
+    try:
+        from PIL import Image
+        import io
+        im = Image.open(io.BytesIO(data)).convert("RGB")
+        w, h = im.size
+        if w > max_w:
+            im = im.resize((max_w, int(h * max_w / w)), Image.LANCZOS)
+        im.save(path, "JPEG", quality=q, optimize=True)
+        return path
+    except Exception:
+        with open(path, "wb") as f:
+            f.write(data)
+        return path
+
+
+def fetch_nmc_charts(out_dir):
+    """抓取 NMC 官方预报图：降水量预报(24h/48h/72h) + FY4B 卫星云图。
+    返回 {label: path}，全部失败返回 {}；异常均吞掉以便降级。"""
+    os.makedirs(out_dir, exist_ok=True)
+    order = [("02400", "24小时降水预报"), ("04800", "48小时降水预报"), ("07200", "72小时降水预报")]
+    charts = {}
+    try:
+        precip_html = http_get(NMC_PRECIP_PAGE).decode("utf-8", "ignore")
+        best = _newest_by_lead(precip_html, _NMC_PRECIP_RE, {l for l, _ in order})
+        for lead, label in order:
+            url = best.get(lead)
+            if not url:
+                continue
+            p = _dl_chart(url, os.path.join(out_dir, "precip_%s.jpg" % lead))
+            charts["降水 · %s" % label] = p
+        if not charts:
+            print("[nmc-img] 降水预报图抓取为空")
+    except Exception as ex:
+        print("[nmc-img] 降水预报图抓取失败:", ex)
+
+    # 卫星云图只保留近 3 天内（避免产品页陈旧图）
+    try:
+        sat_html = http_get(NMC_SAT_PAGE).decode("utf-8", "ignore")
+        m = _NMC_SAT_RE.search(sat_html)
+        if m:
+            base = m.group(1)  # YYYYMMDDHHMM
+            ts = datetime.strptime(base, "%Y%m%d%H%M")
+            if (datetime.now() - ts).days <= 3:
+                p = _dl_chart("https://" + m.group(0), os.path.join(out_dir, "cloud.jpg"))
+                charts["FY4B 卫星云图"] = p
+    except Exception as ex:
+        print("[nmc-img] 卫星云图抓取失败:", ex)
+    return charts
+
+
 # ---------- 渲染 ----------
 CSS = """
 :root{--bg:#eef3f9;--card:#fff;--navy:#14324f;--navy2:#2a5b8c;--ink:#24313d;
@@ -421,10 +500,25 @@ def _clean_cond(v):
 
 
 # ---------- 渲染主函数 ----------
-def render(fetched, ventusky_paths, narr, site_dir, generated):
+def render(fetched, ventusky_paths, nmc_charts, narr, site_dir, generated):
     ts = generated.strftime("%Y-%m-%d %H:%M")
     dstr = generated.strftime("%m月%d日")
     publish = next((c["publish"] for c in fetched.values() if c.get("publish")), "-")
+
+    # ② 官方预报图（NMC）
+    nmc_html = ""
+    if nmc_charts:
+        blocks = ""
+        for label, p in nmc_charts.items():
+            with open(p, "rb") as f:
+                b64 = base64.b64encode(f.read()).decode()
+            blocks += ("<figure><img src='data:image/jpeg;base64,{b}'/><figcaption>{l}</figcaption></figure>").format(
+                b=b64, l=label)
+        nmc_html = ("<div class='card'><h2><span class='no'>2</span>官方预报图（中央气象台 NMC）</h2>"
+                    "<div class='sec-sub'>全国降水量预报 · 逐时效官方发布 · 叠加本轮分区风险交叉印证</div>"
+                    "<div class='grid'>{b}</div>"
+                    "<div class='note'>预报图由国家气象中心（中央气象台）公开产品发布，时效以图中标注为准；"
+                    "图幅为全国范围，盆地落区请结合上方分区风险判断。</div></div>").format(b=blocks)
 
     # ① 双城实况
     now_cards = ""
@@ -618,36 +712,38 @@ def render(fetched, ventusky_paths, narr, site_dir, generated):
 <div class="chunk"><b>解读口径</b><p>本报告不生产新预报，仅对官方逐日预报做分区聚合与透明分级，
   强对流/高温/强降雨的具体落区以属地气象台预警为准。</p></div></div></div>
 
-<div class="card"><h2><span class="no">2</span>双城官方实况</h2>
+{nmc_html}
+
+<div class="card"><h2><span class="no">3</span>双城官方实况</h2>
 <div class="sec-sub">成都 / 重庆 实时观测 · 发布于 {pub}</div><div class="now">{now_cards}</div></div>
 
-<div class="card"><h2><span class="no">3</span>分区天气与三维风险评估</h2>
+<div class="card"><h2><span class="no">4</span>分区天气与三维风险评估</h2>
 <div class="sec-sub">按分区 × 逐日聚合 · 风险合成降雨(0-3)/高温(0-3)/强对流(0-2) 三轴；高/中需重点防范</div>
 {regions_html}
 <div class="note">风险由各分区代表城市官方逐日预报中的最大单日降水、72h最高气温与雷雨对流信号经透明白箱规则综合评定；
   仅作形势研判，灾害性天气请以属地气象台预警为准。</div></div>
 
-<div class="card"><h2><span class="no">4</span>重点天气过程</h2>
+<div class="card"><h2><span class="no">5</span>重点天气过程</h2>
 <div class="sec-sub">由分区风险自动提炼的过程清单</div>
 <ul class="proc">{proc_html}</ul></div>
 
-<div class="card"><h2><span class="no">5</span>分区逐日预报总览（官方）</h2>
+<div class="card"><h2><span class="no">6</span>分区逐日预报总览（官方）</h2>
 <div class="sec-sub">今明两日逐日天气与最高温 · 柱条反映今日相对降水强度</div>
 <table><thead><tr><th>分区</th><th>城市</th><th>今日最高</th><th>今日天气</th><th>明日最高</th><th>明日天气</th></tr></thead>
 <tbody>{rows}</tbody></table></div>
 
 {vent}
 
-<div class="card"><h2><span class="no">7</span>关注与提示</h2>
+<div class="card"><h2><span class="no">8</span>关注与提示</h2>
 <div class="sec-sub">按分区风险生成，红标为首要关注</div>
 <div class="foc">{foc_html}</div>
 {narr_block}</div>
 
-<div class="foot">本页由 GitHub Actions 定时自动生成 · 数据来自中央气象台 NMC{vent_note} · 未经人工审核，仅供参考<br/>
+<div class="foot">本页由 GitHub Actions 定时自动生成 · 数据来自中央气象台 NMC（含官方预报图）{vent_note} · 未经人工审核，仅供参考<br/>
 灾害性天气请以属地气象部门发布的预报预警为准。</div>
 </div></body></html>""".format(
         css=CSS, d=dstr, pub=publish, gen=ts, syn=syn, now_cards=now_cards,
-        regions_html=regions_html, rows=rows, proc_html=proc_html, foc_html=foc_html,
+        nmc_html=nmc_html, regions_html=regions_html, rows=rows, proc_html=proc_html, foc_html=foc_html,
         vent=vent, narr_block=narr_block,
         vent_note=(" / Ventusky" if ventusky_paths else ""))
 
@@ -685,11 +781,13 @@ def main():
 
     vent = capture_ventusky(os.path.join(args.out, "ventusky")) if args.ventusky else {}
 
+    nmc_charts = fetch_nmc_charts(os.path.join(args.out, "nmc"))
+
     narr = llm_summary(fetched) if args.llm else None
     if not narr:
         narr = "（未启用 LLM 润色，采用上方规则化形势概览与分区风险，数据取官方实时。）"
 
-    render(fetched, vent, narr, args.out, datetime.now())
+    render(fetched, vent, nmc_charts, narr, args.out, datetime.now())
 
 
 if __name__ == "__main__":

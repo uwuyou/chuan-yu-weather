@@ -40,7 +40,7 @@ jobs:
       - name: Install playwright (best-effort)
         continue-on-error: true
         run: |
-          pip install --quiet playwright
+          pip install --quiet playwright pillow
           python -m playwright install --with-deps chromium
 
       - name: Build report
