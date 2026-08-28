@@ -1727,8 +1727,205 @@ def render(fetched, ventusky_paths, nmc_charts, narr, site_dir, generated, alarm
 
     narr_block = ""  # 已按需求移除卡片11的"未启用 LLM 润色…"说明段落
 
+
+# ---------- 新增：多层次高空与地面形势研读（官方实况分析图 × 公开多层格点读场） ----------
+ML_STATIONS = [["成都", 30.67, 104.07], ["雅安", 30.01, 103.00], ["广元", 32.43, 105.84],
+               ["南充", 30.80, 106.08], ["重庆", 29.56, 106.55], ["达州", 31.21, 107.47],
+               ["康定", 30.00, 101.96], ["西昌", 27.90, 102.27]]
+ML_LV = [925, 850, 700, 500, 200, 100]
+
+
+def build_multilevel():
+    """多层次高空与地面形势研读：A.官方NMC实况分析图(SFC~100hPa)；B.公开多层格点读场(7-8代表站区域平均)。"""
+    # ---- A. 官方高空实况分析图：SFC/925/850/700/500/200/100 ----
+    tabs, panes, cap_ok = "", "", 0
+    pages = [("h000", "地面(SFC)·海平面气压", "SFC"), ("h925", "925 hPa", "925"),
+             ("h850", "850 hPa", "850"), ("h700", "700 hPa", "700"), ("h500", "500 hPa", "500"),
+             ("h200", "200 hPa", "200"), ("h100", "100 hPa", "100")]
+
+    def _chart(i, pg, lbl, short):
+        try:
+            h = http_get("http://www.nmc.cn/publish/observations/china/dm/weatherchart-%s.htm" % pg, timeout=10).decode("utf-8", "ignore")
+            m = re.search(r'id=imgpath[^>]*\bdata-time="([^"]*)"[^>]*\bsrc="(https://[^"]*)"', h)
+            if not m:
+                return None
+            tm = m.group(1).strip()
+            u = m.group(2).split("?")[0]
+            data = http_get(u, timeout=18)
+            if not data or len(data) < 3000:
+                return None
+            return (i, short, lbl, tm, base64.b64encode(data).decode())
+        except Exception:
+            return None
+
+    got = []
+    with ThreadPoolExecutor(max_workers=7) as ex:
+        futs = [ex.submit(_chart, i, pg, lbl, short) for i, (pg, lbl, short) in enumerate(pages)]
+        for f in as_completed(futs):
+            r = f.result()
+            if r:
+                got.append(r)
+    got.sort()
+    tabs, panes, cap_ok = "", "", 0
+    for r in got:
+        i, short, lbl, tm, b64 = r
+        act = " active" if i == 0 else ""
+        tabs += "<button class='ml-tab%s' data-lv='%d'>%s</button>" % (act, i, short)
+        panes += ("<div class='ml-pane%s' data-lv='%d'><img src='data:image/jpeg;base64,%s'/>"
+                  "<div class='ml-cap'>%s · 北京时 %s</div></div>") % (act, i, b64, lbl, tm)
+        cap_ok += 1
+    figs = ("<div class='ml-tabs'>%s</div><div class='ml-view'>%s</div>" % (tabs, panes)) if cap_ok else ""
+
+    # ---- B. 公开多层格点读场：逐层区域平均（气温/位势高度/风/相对湿度） ----
+    acc = {L: {"T": [], "RH": [], "H": [], "WS": [], "WD": []} for L in ML_LV}
+    omit = []
+
+    def _grid(la, lo):
+        try:
+            varlist = []
+            for L in ML_LV:
+                varlist += ["temperature_%shPa" % L, "relative_humidity_%shPa" % L,
+                            "geopotential_height_%shPa" % L, "wind_speed_%shPa" % L, "wind_direction_%shPa" % L]
+            q = urllib.parse.urlencode({"latitude": "%.3f" % la, "longitude": "%.3f" % lo,
+                                        "hourly": ",".join(varlist), "pressure_level": ",".join(map(str, ML_LV)),
+                                        "forecast_hours": "2", "timezone": "Asia/Shanghai"})
+            d = json.loads(http_get("https://api.open-meteo.com/v1/forecast?" + q, timeout=18).decode())
+            return d.get("hourly") or {}
+        except Exception:
+            return None
+
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        futs = {ex.submit(_grid, la, lo): nm for nm, la, lo in ML_STATIONS}
+        for f in as_completed(futs):
+            nm = futs[f]
+            ho = f.result()
+            if ho is None:
+                omit.append(nm)
+                continue
+            for L in ML_LV:
+                for k, key in (("T", "temperature_%shPa" % L), ("RH", "relative_humidity_%shPa" % L),
+                               ("H", "geopotential_height_%shPa" % L), ("WS", "wind_speed_%shPa" % L),
+                               ("WD", "wind_direction_%shPa" % L)):
+                    arr = ho.get(key) or []
+                    if arr and arr[0] is not None:
+                        acc[L][k].append(float(arr[0]))
+
+    def M(L, k):
+        V = [x for x in acc.get(L, {}).get(k, []) if x is not None]
+        return (sum(V) / len(V)) if V else None
+
+    def Blk(t, txt):
+        return "<div class='ml-blk'><b>%s</b><p>%s</p></div>" % (t, txt)
+
+    t925, t850, t700, t500, t200, t100 = (M(925, 'T'), M(850, 'T'), M(700, 'T'), M(500, 'T'), M(200, 'T'), M(100, 'T'))
+    h925, h850, h700, h500, h200, h100 = (M(925, 'H'), M(850, 'H'), M(700, 'H'), M(500, 'H'), M(200, 'H'), M(100, 'H'))
+    rh850, rh700, rh500 = M(850, 'RH'), M(700, 'RH'), M(500, 'RH')
+    ws925, ws500, ws200 = M(925, 'WS'), M(500, 'WS'), M(200, 'WS')
+    wd850, wd925 = M(850, 'WD'), M(925, 'WD')
+
+    ms = lambda v: ("%.0f" % (v / 3.6)) if v is not None else "-"
+    read = []
+    if h500 is None:
+        read.append(Blk("读场失败", "公开多层格点暂不可用，本卡仅展示官方实况分析图。"))
+    else:
+        # 副高（500hPa位势高度 5880m 判据）
+        if h500 >= 5920:
+            sub = "盆地500hPa位势高度平均约 <b>%d gpm</b>，明显高于5880线，受强副热带高压（或大陆高压）控制，中高空下沉增温显著，利于持续晴热、抑制对流。" % h500
+        elif h500 >= 5880:
+            sub = "盆地500hPa位势高度平均约 <b>%d gpm</b>，位于5880线附近及以上，副热带高压对盆地有控制或边缘影响，是高温与少雨的主导系统。" % h500
+        elif h500 >= 5850:
+            sub = "盆地500hPa位势高度平均约 <b>%d gpm</b>，接近5880线下沿，副高偏弱或偏东，盆地多处于副高边缘，午后局地对流易发。" % h500
+        else:
+            sub = "盆地500hPa位势高度平均约 <b>%d gpm</b>，明显低于5880线，副高主体偏东南退，盆地受西风带短波槽/切变影响更大，降水过程增多。" % h500
+        read.append(Blk("500hPa位势高度 · 环流主导", sub))
+        # 850/700 温湿
+        if t850 is not None:
+            if rh700 is not None and rh700 >= 80:
+                wet = "700hPa平均相对湿度约 <b>%d%%</b>，配合850hPa约 <b>%d%%</b>，湿层深厚，水汽条件充沛。" % (rh700, rh850 if rh850 is not None else 0)
+            elif rh850 is not None and rh850 >= 80 and rh700 is not None and rh700 < 60:
+                wet = "850hPa相对湿度约 <b>%d%%</b> 高湿而700hPa约 <b>%d%%</b> 偏干，存在中空干层，易触发短时强降水/冰雹等强对流。" % (rh850, rh700)
+            else:
+                wet = "850hPa平均相对湿度约 <b>%s%%</b>、700hPa约 <b>%s%%</b>，水汽条件总体一般。" % (("-" if rh850 is None else "%d" % rh850), ("-" if rh700 is None else "%d" % rh700))
+            ht = "中低层850hPa平均气温约 <b>%d℃</b>、700hPa约 <b>%d℃</b>。" % (t850, t700) if t700 is not None else "中低层850hPa平均气温约 <b>%d℃</b>。" % t850
+            read.append(Blk("850/700hPa 温度与水汽层结", ht + wet))
+        # 风场：低空急流与水汽输送
+        if ws925 is not None and ws500 is not None:
+            dir_txt = ""
+            if wd925 is not None:
+                if 180 <= wd925 < 270:
+                    dir_txt = "925hPa为<b>西南风</b>（约占平均风向%d°），利于从南海—孟加拉湾向盆地输送暖湿水汽。" % wd925
+                elif wd925 < 90 or wd925 >= 315:
+                    dir_txt = "925hPa为<b>偏北/东北风</b>（平均风向约%d°），水汽输送偏弱，利于干冷空气南下。" % wd925
+                else:
+                    dir_txt = "925hPa平均风向约<b>%d°</b>（东南-南风），水汽输送一般。" % wd925
+            ws = ms(ws925)
+            if ws925 >= 43:  # 12 m/s
+                we = "925hPa平均风速约 <b>%s m/s</b>，达到<b>低空急流</b>量级，水汽与动量输送显著增强，低层辐合有利抬升。" % ws
+            else:
+                we = "925hPa平均风速约 <b>%s m/s</b>，低空急流不明显。" % ws
+            up = "500hPa平均风速约 <b>%s m/s</b>。" % ms(ws500)
+            read.append(Blk("风场 · 低空急流与水汽输送", dir_txt + we + up))
+        # 高空急流与辐散
+        if ws200 is not None:
+            ws2 = ms(ws200)
+            if ws200 >= 108:  # 30 m/s
+                div = "200hPa平均风速约 <b>%s m/s</b>，高空西风急流强盛，高空辐散明显，与低层辐合配合则垂直上升运动强、利于中尺度系统发展。" % ws2
+            else:
+                div = "200hPa平均风速约 <b>%s m/s</b>，高空辐散一般。" % ws2
+            read.append(Blk("200hPa 高空急流与辐散", div))
+        # 对流稳定度
+        if t850 is not None and t500 is not None:
+            dT = t850 - t500
+            if dT >= 28:
+                st = "850-500hPa温差约 <b>%d℃</b>，层结<b>极不稳定</b>，配合触发机制极易出现强对流。" % dT
+            elif dT >= 24:
+                st = "850-500hPa温差约 <b>%d℃</b>，层结<b>较不稳定</b>，午后热力对流潜势较高。" % dT
+            else:
+                st = "850-500hPa温差约 <b>%d℃</b>，层结相对稳定，对流潜势一般。" % dT
+            read.append(Blk("垂直稳定度（850-500hPa）", st))
+        # 分区研判
+        parts = []
+        parts.append("盆西（成都-雅安）沿山若850hPa为西南风且水汽充沛，叠加不稳定层结，午后到夜间局地对流与沿山降水风险偏高；")
+        if h500 is not None and h500 >= 5880:
+            parts.append("盆东（重庆-达州）500hPa高度偏高，中低空多为暖脊控制，持续晴热、高温伏旱风险为主；")
+        else:
+            parts.append("盆东（重庆-达州）若处于副高边缘或切变南侧，仍以闷热与局地雷阵雨为主；")
+        parts.append("川西高原及川西南山地受地形抬升影响，当低层偏南风＋中空较干时，午后局地强对流（短时强降雨/雷暴）需关注。")
+        read.append(Blk("川渝分区研判", "".join(parts)))
+        if omit:
+            read.append(Blk("说明", "以下代表站读场未取到：" + "、".join(omit) + "，结果以其余站点区域平均为准。"))
+
+    read_html = "<div class='ml-read'>%s</div>" % "".join(read)
+
+    return """<div class="card" id="mlcard"><h2><span class="no">11</span>多层次高空与地面形势研读（SFC~100hPa）</h2>
+<div class="sec-sub">NMC官方实况分析图 × 公开多层格点垂直读场 · 自下而上解读川渝垂直方向天气配置</div>
+__MLREAD____MLFIGS__
+<style>
+.ml-read{margin:6px 0 14px}
+.ml-blk{padding:7px 0;border-bottom:1px dashed #e2e8ee}
+.ml-blk b{color:#c23b2e;font-size:13px;display:block;margin-bottom:3px}
+.ml-blk p{margin:0;line-height:1.75;color:#31455c;font-size:13.5px}
+.ml-tabs{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0 8px}
+.ml-tab{border:1px solid #c9d6e2;background:#fff;color:#41556a;border-radius:18px;padding:5px 13px;cursor:pointer;font-size:12.5px}
+.ml-tab.active{background:#12395b;border-color:#12395b;color:#fff}
+.ml-view{background:#e9edf2;border:1px solid #e3eaf0;border-radius:10px;padding:8px;overflow:hidden}
+.ml-pane{display:none}
+.ml-pane.active{display:block}
+.ml-pane img{width:100%;display:block;border-radius:6px}
+.ml-cap{font-size:12px;color:#7b8ca0;padding:6px 2px 2px;text-align:center}
+</style>
+<script>(function(){var c=document.getElementById('mlcard');if(!c)return;var b=c.querySelectorAll('.ml-tab'),p=c.querySelectorAll('.ml-pane');
+for(var i=0;i<b.length;i++)b[i].onclick=(function(btn){return function(){var lv=btn.getAttribute('data-lv');for(var j=0;j<b.length;j++)b[j].classList.toggle('active',b[j]===btn);for(var j=0;j<p.length;j++)p[j].classList.toggle('active',p[j].getAttribute('data-lv')===lv);};})(b[i]);})();</script>
+</div>""".replace("__MLREAD__", read_html).replace("__MLFIGS__", figs)
+
+    try:
+        ml_html = build_multilevel()
+    except Exception:
+        ml_html = ("<div class='card'><h2><span class='no'>11</span>多层次高空与地面形势研读（SFC~100hPa）</h2>"
+                   "<div class='sec-sub'>本卡生成失败，请下次构建重试</div></div>")
+
     html = """<!DOCTYPE html>
-<html lang="zh">
+   <html lang="zh">
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>川渝天气展望 · 分区风险分析报告 {d}</title><style>{css}</style></head>
 <body><div class="wrap">
@@ -1773,7 +1970,9 @@ def render(fetched, ventusky_paths, nmc_charts, narr, site_dir, generated, alarm
 
 {vent}
 
-<div class="card"><h2><span class="no">11</span>关注与提示</h2>
+{ml_html}
+
+<div class="card"><h2><span class="no">12</span>关注与提示</h2>
 <div class="sec-sub">按分区风险生成，红标为首要关注</div>
 <div class="foc">{foc_html}</div>
 {narr_block}</div>
@@ -1790,7 +1989,7 @@ def render(fetched, ventusky_paths, nmc_charts, narr, site_dir, generated, alarm
         nmc_html=nmc_html, expert_html=expert_html, alarm_html=alarm_html,
         map_html=map_html, regions_html=regions_html,
         rows=rows, proc_html=proc_html, foc_html=foc_html,
-        vent=vent, narr_block=narr_block,
+        vent=vent, narr_block=narr_block, ml_html=ml_html,
         live_js=LIVE_JS,
         live_forecast_js=LIVE_FORECAST_JS.replace("__LIVE_CODES__", json.dumps(live_codes, ensure_ascii=False)),
         live_alarm_js=LIVE_ALARM_JS,
