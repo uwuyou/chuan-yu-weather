@@ -458,6 +458,45 @@ def build_alarm_card(alarms, cnt, top=22):
         banner=banner, stats=stats, rows=rows, more=more)
 
 
+# 前端实时刷新脚本：页面每次打开即向 NMC 拉取成都/重庆实况，更新双城卡片与预报发布时间。
+# 纯字符串（不经 .format），花括号为 JS 字面量；CORS 已开放(nmc.cn)，失败时保留静态兜底值。
+LIVE_JS = r"""<script>
+(function(){
+  var CODES={"成都":"yGYHR","重庆":"UkfaS"};
+  function pad(n){return (n<10?"0":"")+n;}
+  function rt(x){return (x==null||isNaN(x))?"-":Math.round(x);}
+  function cleanPub(p){var m=String(p||"").match(/(\d{1,2}):(\d{2})/);return m?pad(+m[1])+":"+m[2]:"-";}
+  var cards=[].slice.call(document.querySelectorAll(".city"));
+  if(!cards.length) return;
+  var remaining=cards.length, pubs=[];
+  cards.forEach(function(card){
+    var code=CODES[card.getAttribute("data-city")];
+    if(!code){remaining--;return;}
+    fetch("https://www.nmc.cn/rest/weather?stationid="+code,{headers:{"X-Requested-With":"fetch"}})
+      .then(function(r){return r.json();})
+      .then(function(d){
+        var real=(d&&d.data&&d.data.real)||{}, wea=real.weather||{}, wind=real.wind||{};
+        var tv=card.querySelector(".tval");
+        if(wea.temperature!=null&&tv) tv.textContent=rt(wea.temperature);
+        if(real.publish_time){
+          var flag=card.querySelector(".top .flag");
+          if(flag) flag.textContent="实况 "+cleanPub(real.publish_time);
+          pubs.push(real.publish_time);
+        }
+        var dt=card.querySelector(".dt");
+        if(dt){
+          var today=dt.getAttribute("data-today")||"";
+          var ws=(wind.dir!=null?(wind.dir+(wind.speed!=null?" "+wind.speed:"")):"-");
+          var hum=(wea.humidity!=null)?Math.round(wea.humidity)+"%":"-";
+          dt.innerHTML=(ws+" · 湿度 "+hum+" · 今日 "+today);
+        }
+      }).catch(function(){})
+      .then(function(){ remaining--; if(remaining<=0&&pubs.length){pubs.sort();var pv=document.querySelector(".pub-val");if(pv)pv.textContent=cleanPub(pubs[pubs.length-1]);} });
+  });
+ })();
+ </script>"""
+
+
 # ---------- 渲染 ----------
 CSS = """
 :root{--bg:#eef3f9;--card:#fff;--navy:#14324f;--navy2:#2a5b8c;--ink:#24313d;
@@ -824,10 +863,10 @@ def render(fetched, ventusky_paths, nmc_charts, narr, site_dir, generated, alarm
         c = fetched.get(key)
         if not c:
             continue
-        now_cards += ("<div class='city'><div class='top'><span class='nm'>{nm}</span>"
+        now_cards += ("<div class='city' data-city='{nm}'><div class='top'><span class='nm'>{nm}</span>"
                       "<span class='flag'>实况 {pub}</span></div>"
-                      "<div class='tg'>{t}℃{tag}</div>"
-                      "<div class='dt'>{wind} · 湿度 {hum} · 今日 {today}</div></div>").format(
+                      "<div class='tg'><span class='tval'>{t}</span>℃{tag}</div>"
+                      "<div class='dt' data-today=\"{today}\">{wind} · 湿度 {hum} · 今日 {today}</div></div>").format(
             nm=c["name"], t=fmt_temp(c.get("now_temp")),
             tag=("　<small>{info}</small>" % {"info": _clean_cond(c.get("now_info"))}) if _clean_cond(c.get("now_info")) else "",
             pub=((c.get("publish") or "")[-5:] or "-"),
@@ -1007,7 +1046,7 @@ def render(fetched, ventusky_paths, nmc_charts, narr, site_dir, generated, alarm
   <span class="kicker">Sichuan &amp; Chongqing Weather Outlook</span>
   <h1>川渝天气展望 · 分区风险分析报告</h1>
   <div class="sub">基于中央气象台官方预报 · 七分区 × 降雨/高温/强对流三维风险 · 未来3日演变趋势</div>
-  <div class="meta"><span><b>报告日期</b> {d}</span><span><b>预报发布</b> {pub}</span>
+  <div class="meta"><span><b>报告日期</b> {d}</span><span><b>预报发布</b> <span class="pub-val">{pub}</span></span>
     <span><b>数据源</b> 中央气象台 NMC</span><span><b>分析范式</b> weather-analyst</span>
     <span><b>生成时间</b> {gen}</span></div>
 </div>
@@ -1047,14 +1086,17 @@ def render(fetched, ventusky_paths, nmc_charts, narr, site_dir, generated, alarm
 <div class="foc">{foc_html}</div>
 {narr_block}</div>
 
-<div class="foot">本页由 GitHub Actions 定时自动生成 · 数据来自中央气象台 NMC（含官方预报图）{vent_note} · 未经人工审核，仅供参考<br/>
-灾害性天气请以属地气象部门发布的预报预警为准。</div>
-</div></body></html>""".format(
+<footer>
+  <div class="foot">本页由 GitHub Actions 定时自动生成 · 数据来自中央气象台 NMC（含官方预报图）{vent_note} · 未经人工审核，仅供参考<br/>
+  灾害性天气请以属地气象部门发布的预报预警为准。双城实况与预报发布在页面加载时实时向 NMC 刷新。</div>
+ </footer>
+ <script>{live_js}</script>
+ </body></html>""".format(
         css=CSS, d=dstr, pub=publish, gen=ts, syn=syn, now_cards=now_cards,
         nmc_html=nmc_html, expert_html=expert_html, alarm_html=alarm_html,
         regions_html=regions_html,
         rows=rows, proc_html=proc_html, foc_html=foc_html,
-        vent=vent, narr_block=narr_block,
+        vent=vent, narr_block=narr_block, live_js=LIVE_JS,
         vent_note=(" / Ventusky" if ventusky_paths else ""))
 
     os.makedirs(site_dir, exist_ok=True)
