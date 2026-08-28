@@ -337,6 +337,127 @@ def fetch_nmc_charts(out_dir):
     return charts
 
 
+# ---------- 官方预警信号（weather.cma.cn 中国气象局全国预警） ----------
+ALARM_API = "https://weather.cma.cn/api/map/alarm?adcode={code}"
+ALARM_ADCODES = [("51", "四川"), ("50", "重庆")]
+ALARM_LEVELS = ["红色", "橙色", "黄色", "蓝色"]               # 级别由高到低
+_ALARM_CATS = ["地质灾害气象", "道路结冰", "低温雨雪", "森林草原火险", "森林火险",
+               "强对流云团", "雷雨大风", "沙尘暴", "台风", "暴雨大风", "暴雨", "暴雪",
+               "寒潮", "大风", "冰雹", "雷电", "大雾", "高温", "干旱", "霜冻", "山洪",
+               "强对流", "低温", "霾"]
+ALARM_REGION_MAP = [   # 预警发布地区字符串 → 我们的分区（子串匹配）
+    ("盆西", ["成都", "雅安", "眉山"]),
+    ("盆东", ["重庆", "广安"]),
+    ("盆中", ["遂宁", "南充", "资阳"]),
+    ("盆北", ["广元", "绵阳", "巴中"]),
+    ("川西高原", ["甘孜", "阿坝", "康定", "马尔康"]),
+    ("川西南", ["凉山", "西昌", "攀枝花"]),
+    ("川东北", ["达州", "巴中"]),
+]
+
+
+def _alarm_parse(item):
+    text = (item.get("headline") or "") + " " + (item.get("title") or "")
+    level = next((l for l in ALARM_LEVELS if l in text), "")
+    cat = next((c for c in _ALARM_CATS if c in text), "其他")
+    area = ((item.get("title") or "").split("发布")[0].strip()) or "-"
+    return {"cat": cat, "level": level, "area": area,
+            "desc": item.get("description") or "",
+            "time": (item.get("effective") or "").replace("/", "-")}
+
+
+def fetch_alarms():
+    """抓取四川/重庆现行官方预警。
+    返回 (uniq_alarms, 各省条数 dict)；任一失败均降级。"""
+    alarms, cnt = [], {}
+    for code, prov in ALARM_ADCODES:
+        try:
+            raw = json.loads(http_get(ALARM_API.format(code=code), timeout=15).decode("utf-8"))
+            items = (raw or {}).get("data") or []
+        except Exception as ex:
+            print("[alarm] %s 抓取失败: %s" % (prov, ex))
+            continue
+        cnt[prov] = len(items)
+        for it in items:
+            a = _alarm_parse(it)
+            a["prov"] = prov
+            a["regions"] = [rg for rg, keys in ALARM_REGION_MAP
+                            if any(k in a["area"] for k in keys) or
+                            (rg == "盆东" and prov == "重庆")]
+            alarms.append(a)
+    # 去重：同类同级同地区只保留一条
+    seen, uniq = set(), []
+    for a in alarms:
+        k = (a["cat"], a["level"], a["area"])
+        if k in seen:
+            continue
+        seen.add(k)
+        uniq.append(a)
+    order = {l: i for i, l in enumerate(ALARM_LEVELS)}
+    uniq.sort(key=lambda a: (order.get(a["level"], 9), a["prov"]))
+    return uniq, cnt
+
+
+def build_alarm_card(alarms, cnt, top=22):
+    """把官方预警渲染成一张卡片 HTML；无预警或全失败返回空串。"""
+    if not alarms:
+        return ""
+    n = len(alarms)
+    sc = sum(1 for a in alarms if a["prov"] == "四川")
+    cq = sum(1 for a in alarms if a["prov"] == "重庆")
+    counts = {l: sum(1 for a in alarms if a["level"] == l) for l in ALARM_LEVELS}
+    order = {l: i for i, l in enumerate(ALARM_LEVELS)}
+    hi = next((l for l in ALARM_LEVELS if counts.get(l)), "")
+    BZ = {"红色": "严重", "橙色": "较重", "黄色": "注意", "蓝色": "一般"}
+
+    # 顶部横幅：突出"涉及本报告分区"的红/橙预警
+    critical = [a for a in alarms
+                if a["level"] in ("红色", "橙色") and a["regions"]]
+    if critical:
+        rgs = "、".join(sorted({r for a in critical for r in a["regions"]}))
+        cats = "、".join(sorted({a["cat"] for a in critical}))
+        banner = ("<span class='ab-icon'>⚠</span>"
+                  "<div><b>本报告分区 {rgs} 现有多条{lv}预警</b>"
+                  "<span>类型：{cats}｜请以属地气象台最新发布为准，红色/橙色预警区域避免高风险活动。</span></div>").format(
+            rgs=rgs or "川渝", lv=next((l for l in ("红色", "橙色") if counts.get(l)), ""),
+            cats=cats or "-")
+    else:
+        banner = ("<div><b>当前川渝最高预警级别：{lv}（{bz}）</b>"
+                  "<span>生效预警共 {n} 条，红橙黄蓝按官方分级，请关注与您所在/前往地区相关条目。</span></div>").format(
+            lv=hi or "无", bz=BZ.get(hi, "-"), n=n)
+
+    # 分级别统计条
+    stat_chips = "".join(
+        "<span class='s-chip c-{l}'>{l} {c}</span>".format(l=l, c=counts[l])
+        for l in ALARM_LEVELS if counts.get(l))
+    stats = ("<span class='s-total'>四川 {sc} 条 · 重庆 {cq} 条 · 共 {n} 条</span>{chips}").format(
+        sc=sc, cq=cq, n=n, chips=stat_chips)
+
+    # 列表
+    rows = ""
+    shown = 0
+    for a in alarms[:top]:
+        shown += 1
+        tags = "".join("<span class='areg'>{r}</span>".format(r=r) for r in a["regions"])
+        rows += ("<div class='alarm-row'><span class='alv lv-{l}'>{l}</span>"
+                 "<span class='acat'>{cat}</span><span class='aarea'>{area}</span>"
+                 "<span class='atime'>{time}</span>{tags}</div>").format(
+            l=a["level"] or "其他", cat=a["cat"], area=a["area"],
+            time=(a["time"] or "-")[5:] or "-", tags=tags)
+    rest = n - shown
+    more = ("<div class='alarm-more'>另有 {rest} 条其余预警未列出，完整清单见属地气象台或" 
+            "<a href='http://www.nmc.cn/'>中央气象台预警</a>。</div>").format(rest=rest) if rest > 0 else ""
+
+    return ("""<div class='card'><h2><span class='no'>4</span>官方预警信号（实时）</h2>
+<div class='sec-sub'>数据源：中国气象局 weather.cma.cn 国家预警信息发布中心 · 覆盖四川、重庆 · 按级别/分区聚合</div>
+<div class='alarm-banner'>{banner}</div>
+<div class='alarm-stats'>{stats}</div>
+<div class='alarms'>{rows}</div>
+{more}
+<div class='note'>预警为官方实时发布，反映当下风险等级；本报告仅做聚合与解读，具体防御请严格遵循属地气象台预警与当地应急指令。</div></div>""").format(
+        banner=banner, stats=stats, rows=rows, more=more)
+
+
 # ---------- 渲染 ----------
 CSS = """
 :root{--bg:#eef3f9;--card:#fff;--navy:#14324f;--navy2:#2a5b8c;--ink:#24313d;
@@ -475,6 +596,30 @@ th:first-child,td:first-child,th:nth-child(2),td:nth-child(2){text-align:left}
 .echunk b{color:#0f2c47;margin-right:4px;font-weight:700}
 .echunk .hl{color:var(--red);font-weight:700}
 .echunk .ok{color:var(--green);font-weight:700}
+
+/* 官方预警信号 */
+.alarm-banner{display:flex;align-items:flex-start;gap:11px;padding:12px 14px;margin-bottom:12px;
+  border-radius:10px;background:linear-gradient(180deg,#fff5f4,#fdeeed);
+  border:1px solid #f2c4be;font-size:13.2px;color:#5a3030;line-height:1.7}
+.alarm-banner b{color:#b32c1f;font-size:14px}
+.alarm-banner .ab-icon{font-size:17px;line-height:1.4}
+.alarm-stats{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin-bottom:12px;font-size:12.3px}
+.alarm-stats .s-total{color:var(--muted);margin-right:2px}
+.s-chip{display:inline-block;padding:2px 9px;border-radius:14px;font-size:11.6px;font-weight:800;color:#fff}
+.c-红色{background:#c23b2e}.c-橙色{background:#e2853a}.c-黄色{background:#c9a227;color:#3b2f00}
+.c-蓝色{background:#3a79c2}
+.alarms{display:flex;flex-direction:column;gap:6px;margin-bottom:6px}
+.alarm-row{display:flex;align-items:center;gap:9px;flex-wrap:wrap;padding:6px 10px;border:1px solid var(--line);
+  border-radius:9px;background:#fbfcfe;font-size:12.8px}
+.alv{flex:none;color:#fff;font-size:11.2px;font-weight:800;padding:2px 8px;border-radius:7px;min-width:34px;text-align:center}
+.lv-红色{background:#c23b2e}.lv-橙色{background:#e2853a}.lv-黄色{background:#c9a227;color:#3b2f00}
+.lv-蓝色{background:#3a79c2}.lv-其他{background:#8aa0b5}
+.acat{flex:none;font-weight:700;color:var(--navy)}
+.aarea{flex:1 1 220px;color:#41556a;min-width:130px}
+.atime{flex:none;color:var(--muted);font-size:11.4px}
+.areg{flex:none;font-size:10.4px;color:#fff;background:var(--accent);border-radius:6px;padding:1px 6px;font-weight:700}
+.alarm-more{font-size:12px;color:var(--muted);margin:8px 2px 2px}
+.alarm-more a{color:var(--accent)}
 .note{background:#fff8ea;border:1px solid #f0dca8;color:#7a5b12;border-radius:10px;padding:10px 14px;
   font-size:12.3px;margin-top:14px}
 .foot{font-size:11.6px;color:#8697aa;margin-top:26px;text-align:center;line-height:1.8}
@@ -641,10 +786,13 @@ def build_expert(fetched):
 
 
 # ---------- 渲染主函数 ----------
-def render(fetched, ventusky_paths, nmc_charts, narr, site_dir, generated):
+def render(fetched, ventusky_paths, nmc_charts, narr, site_dir, generated, alarms=None, alarm_cnt=None):
     ts = generated.strftime("%Y-%m-%d %H:%M")
     dstr = generated.strftime("%m月%d日")
     publish = next((c["publish"] for c in fetched.values() if c.get("publish")), "-")
+
+    # 官方预警卡片（插入为卡片 4）
+    alarm_html = build_alarm_card(alarms or [], alarm_cnt or {})
 
     # ② 官方预报图（NMC）
     nmc_html = ""
@@ -805,6 +953,14 @@ def render(fetched, ventusky_paths, nmc_charts, narr, site_dir, generated):
     # 关注与提示卡片
     if not focus:
         focus.append(("norm", "天气平稳", "区域无显著灾害性天气，正常生活与出行即可"))
+    # 官方预警回响：把涉及本报告分区的红/橙预警置顶
+    if alarms:
+        crit = [a for a in alarms if a["level"] in ("红色", "橙色") and a["regions"]]
+        if crit:
+            rgs = "、".join(sorted({r for a in crit for r in a["regions"]}))
+            cats = "、".join(sorted({a["cat"] for a in crit}))
+            focus.insert(0, ("red", "官方预警", "%s 现有多条红/橙预警（%s），请以属地气象台最新发布为准，尽量避免高风险户外活动"
+                             % (rgs or "川渝", cats or "-")))
     foc_html = "".join("<div class='f {cl}'><b>{t}</b>{d}</div>".format(cl=cl, t=t, d=d) for cl, t, d in focus)
 
     # ④ 分区逐日总览(16城)：今日 + 明日
@@ -835,7 +991,7 @@ def render(fetched, ventusky_paths, nmc_charts, narr, site_dir, generated):
             mime = "image/jpeg" if p.lower().endswith((".jpg", ".jpeg")) else "image/png"
             blocks += ("<figure><img src='data:{m};base64,{b}'/><figcaption>{l}</figcaption></figure>").format(
                 m=mime, b=b64, l={"wind": "风场", "rain": "降水落区", "temperature": "气温", "pressure": "海平面气压"}.get(k, k))
-        vent = ("<div class='card'><h2><span class='no'>8</span>多要素实况解析（Ventusky 数值模式）</h2>"
+        vent = ("<div class='card'><h2><span class='no'>9</span>多要素实况解析（Ventusky 数值模式）</h2>"
                 "<div class='sec-sub'>同一时刻四要素 · 叠加地形与城市标注 · 与官方数据交叉印证</div>"
                 "<div class='grid'>{b}</div>"
                 "<div class='note'>实况要素面交叉印证，具体取值与结论以中央气象台及属地气象部门官方预报为准。</div></div>").format(b=blocks)
@@ -864,28 +1020,29 @@ def render(fetched, ventusky_paths, nmc_charts, narr, site_dir, generated):
 
 {nmc_html}
 {expert_html}
+{alarm_html}
 
-<div class="card"><h2><span class="no">4</span>双城官方实况</h2>
+<div class="card"><h2><span class="no">5</span>双城官方实况</h2>
 <div class="sec-sub">成都 / 重庆 实时观测 · 发布于 {pub}</div><div class="now">{now_cards}</div></div>
 
-<div class="card"><h2><span class="no">5</span>分区天气与三维风险评估</h2>
+<div class="card"><h2><span class="no">6</span>分区天气与三维风险评估</h2>
 <div class="sec-sub">按分区 × 逐日聚合 · 风险合成降雨(0-3)/高温(0-3)/强对流(0-2) 三轴；高/中需重点防范</div>
 {regions_html}
 <div class="note">风险由各分区代表城市官方逐日预报中的最大单日降水、72h最高气温与雷雨对流信号经透明白箱规则综合评定；
   仅作形势研判，灾害性天气请以属地气象台预警为准。</div></div>
 
-<div class="card"><h2><span class="no">6</span>重点天气过程</h2>
+<div class="card"><h2><span class="no">7</span>重点天气过程</h2>
 <div class="sec-sub">由分区风险自动提炼的过程清单</div>
 <ul class="proc">{proc_html}</ul></div>
 
-<div class="card"><h2><span class="no">7</span>分区逐日预报总览（官方）</h2>
+<div class="card"><h2><span class="no">8</span>分区逐日预报总览（官方）</h2>
 <div class="sec-sub">今明两日逐日天气与最高温 · 柱条反映今日相对降水强度</div>
 <table><thead><tr><th>分区</th><th>城市</th><th>今日最高</th><th>今日天气</th><th>明日最高</th><th>明日天气</th></tr></thead>
 <tbody>{rows}</tbody></table></div>
 
 {vent}
 
-<div class="card"><h2><span class="no">9</span>关注与提示</h2>
+<div class="card"><h2><span class="no">10</span>关注与提示</h2>
 <div class="sec-sub">按分区风险生成，红标为首要关注</div>
 <div class="foc">{foc_html}</div>
 {narr_block}</div>
@@ -894,7 +1051,8 @@ def render(fetched, ventusky_paths, nmc_charts, narr, site_dir, generated):
 灾害性天气请以属地气象部门发布的预报预警为准。</div>
 </div></body></html>""".format(
         css=CSS, d=dstr, pub=publish, gen=ts, syn=syn, now_cards=now_cards,
-        nmc_html=nmc_html, expert_html=expert_html, regions_html=regions_html,
+        nmc_html=nmc_html, expert_html=expert_html, alarm_html=alarm_html,
+        regions_html=regions_html,
         rows=rows, proc_html=proc_html, foc_html=foc_html,
         vent=vent, narr_block=narr_block,
         vent_note=(" / Ventusky" if ventusky_paths else ""))
@@ -935,11 +1093,15 @@ def main():
 
     nmc_charts = fetch_nmc_charts(os.path.join(args.out, "nmc"))
 
+    alarms, alarm_cnt = fetch_alarms()
+    if alarms:
+        print("[alarm] 已取官方预警 {n} 条 (去重后)".format(n=len(alarms)))
+
     narr = llm_summary(fetched) if args.llm else None
     if not narr:
         narr = "（未启用 LLM 润色，采用上方规则化形势概览与分区风险，数据取官方实时。）"
 
-    render(fetched, vent, nmc_charts, narr, args.out, datetime.now())
+    render(fetched, vent, nmc_charts, narr, args.out, datetime.now(), alarms, alarm_cnt)
 
 
 if __name__ == "__main__":
