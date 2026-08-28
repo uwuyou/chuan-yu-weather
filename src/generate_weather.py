@@ -1725,7 +1725,92 @@ def render(fetched, ventusky_paths, nmc_charts, narr, site_dir, generated, alarm
                 "<div class='grid'>{b}</div>"
                 "<div class='note'>实况要素面交叉印证，具体取值与结论以中央气象台及属地气象部门官方预报为准。</div></div>").format(b=blocks)
 
-    narr_block = ""  # 已按需求移除卡片11的"未启用 LLM 润色…"说明段落
+    narr_block = ""
+
+    try:
+        ml_html = build_multilevel()
+    except Exception:
+        ml_html = ("<div class='card'><h2><span class='no'>11</span>多层次高空与地面形势研读（SFC~100hPa）</h2>"
+                   "<div class='sec-sub'>本卡生成失败，请下次构建重试</div></div>")
+
+    html = """<!DOCTYPE html>
+   <html lang="zh">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>川渝天气展望 · 分区风险分析报告 {d}</title><style>{css}</style></head>
+<body><div class="wrap">
+<div class="hero">
+  <span class="kicker">Sichuan &amp; Chongqing Weather Outlook</span>
+  <h1>川渝天气展望 · 分区风险分析报告</h1>
+  <div class="sub">基于中央气象台官方预报 · 七分区 × 降雨/高温/强对流三维风险 · 未来3日演变趋势</div>
+  <div class="meta"><span><b>报告日期</b> {d}</span><span><b>预报发布</b> <span class="pub-val">{pub}</span></span>
+    <span><b>数据源</b> 中央气象台 NMC</span><span><b>分析范式</b> weather-analyst</span>
+    <span><b>生成时间</b> {gen}</span></div>
+</div>
+
+<div class="card"><h2><span class="no">1</span>形势概览</h2>
+<div class="sec-sub">自大尺度环流切入，先判"盆西水深 / 盆东火热"式的区域格局</div>
+<div class="syn"><div class="chunk"><b>环流判断</b><p>{syn}</p></div>
+<div class="chunk"><b>解读口径</b><p>本报告不生产新预报，仅对官方逐日预报做分区聚合与透明分级，
+  强对流/高温/强降雨的具体落区以属地气象台预警为准。</p></div></div></div>
+
+{nmc_html}
+{expert_html}
+{alarm_html}
+
+<div class="card"><h2><span class="no">5</span>双城官方实况</h2>
+<div class="sec-sub">成都 / 重庆 实时观测 · 实时刷新于 {pub}</div><div class="now">{now_cards}</div></div>
+
+{map_html}
+
+<div class="card"><h2><span class="no">7</span>分区天气与三维风险评估</h2>
+<div class="sec-sub">按分区 × 逐日聚合 · 风险合成降雨(0-3)/高温(0-3)/强对流(0-2) 三轴；高/中需重点防范</div>
+{regions_html}
+<div class="note">风险由各分区代表城市官方逐日预报中的最大单日降水、72h最高气温与雷雨对流信号经透明白箱规则综合评定；
+  仅作形势研判，灾害性天气请以属地气象台预警为准。</div></div>
+
+<div class="card"><h2><span class="no">8</span>重点天气过程</h2>
+<div class="sec-sub">由分区风险自动提炼的过程清单</div>
+<ul class="proc">{proc_html}</ul></div>
+
+<div class="card"><h2><span class="no">9</span>分区逐日预报总览（官方）</h2>
+<div class="sec-sub">今明两日逐日天气与最高温 · 柱条反映今日相对降水强度</div>
+<table><thead><tr><th>分区</th><th>城市</th><th>今日最高</th><th>今日天气</th><th>明日最高</th><th>明日天气</th></tr></thead>
+<tbody>{rows}</tbody></table></div>
+
+{vent}
+
+{ml_html}
+
+<div class="card"><h2><span class="no">12</span>关注与提示</h2>
+<div class="sec-sub">按分区风险生成，红标为首要关注</div>
+<div class="foc">{foc_html}</div>
+{narr_block}</div>
+
+<footer>
+  <div class="foot">本页由 GitHub Actions 定时自动生成 · 数据来自中央气象台 NMC（含官方预报图）{vent_note} · 未经人工审核，仅供参考<br/>
+  灾害性天气请以属地气象部门发布的预报预警为准。实况/预报与官方预警在页面加载后持续自动向 NMC、国家预警中心实时追更。</div>
+ </footer>
+ {live_js}
+ {live_forecast_js}
+ {live_alarm_js}
+ </body></html>""".format(
+        css=CSS, d=dstr, pub=publish, gen=ts, syn=syn, now_cards=now_cards,
+        nmc_html=nmc_html, expert_html=expert_html, alarm_html=alarm_html,
+        map_html=map_html, regions_html=regions_html,
+        rows=rows, proc_html=proc_html, foc_html=foc_html,
+        vent=vent, narr_block=narr_block, ml_html=ml_html,
+        live_js=LIVE_JS,
+        live_forecast_js=LIVE_FORECAST_JS.replace("__LIVE_CODES__", json.dumps(live_codes, ensure_ascii=False)),
+        live_alarm_js=LIVE_ALARM_JS,
+        vent_note=(" / Ventusky" if ventusky_paths else ""))
+
+    os.makedirs(site_dir, exist_ok=True)
+    out = os.path.join(site_dir, "index.html")
+    with open(out, "w", encoding="utf-8") as f:
+        f.write(html)
+    print("已生成:", out)
+    return out
+  # 已按需求移除卡片11的"未启用 LLM 润色…"说明段落
 
 
 # ---------- 新增：多层次高空与地面形势研读（官方实况分析图 × 公开多层格点读场） ----------
@@ -1918,89 +2003,6 @@ __MLREAD____MLFIGS__
 for(var i=0;i<b.length;i++)b[i].onclick=(function(btn){return function(){var lv=btn.getAttribute('data-lv');for(var j=0;j<b.length;j++)b[j].classList.toggle('active',b[j]===btn);for(var j=0;j<p.length;j++)p[j].classList.toggle('active',p[j].getAttribute('data-lv')===lv);};})(b[i]);})();</script>
 </div>""".replace("__MLREAD__", read_html).replace("__MLFIGS__", figs)
 
-    try:
-        ml_html = build_multilevel()
-    except Exception:
-        ml_html = ("<div class='card'><h2><span class='no'>11</span>多层次高空与地面形势研读（SFC~100hPa）</h2>"
-                   "<div class='sec-sub'>本卡生成失败，请下次构建重试</div></div>")
-
-    html = """<!DOCTYPE html>
-   <html lang="zh">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>川渝天气展望 · 分区风险分析报告 {d}</title><style>{css}</style></head>
-<body><div class="wrap">
-<div class="hero">
-  <span class="kicker">Sichuan &amp; Chongqing Weather Outlook</span>
-  <h1>川渝天气展望 · 分区风险分析报告</h1>
-  <div class="sub">基于中央气象台官方预报 · 七分区 × 降雨/高温/强对流三维风险 · 未来3日演变趋势</div>
-  <div class="meta"><span><b>报告日期</b> {d}</span><span><b>预报发布</b> <span class="pub-val">{pub}</span></span>
-    <span><b>数据源</b> 中央气象台 NMC</span><span><b>分析范式</b> weather-analyst</span>
-    <span><b>生成时间</b> {gen}</span></div>
-</div>
-
-<div class="card"><h2><span class="no">1</span>形势概览</h2>
-<div class="sec-sub">自大尺度环流切入，先判"盆西水深 / 盆东火热"式的区域格局</div>
-<div class="syn"><div class="chunk"><b>环流判断</b><p>{syn}</p></div>
-<div class="chunk"><b>解读口径</b><p>本报告不生产新预报，仅对官方逐日预报做分区聚合与透明分级，
-  强对流/高温/强降雨的具体落区以属地气象台预警为准。</p></div></div></div>
-
-{nmc_html}
-{expert_html}
-{alarm_html}
-
-<div class="card"><h2><span class="no">5</span>双城官方实况</h2>
-<div class="sec-sub">成都 / 重庆 实时观测 · 实时刷新于 {pub}</div><div class="now">{now_cards}</div></div>
-
-{map_html}
-
-<div class="card"><h2><span class="no">7</span>分区天气与三维风险评估</h2>
-<div class="sec-sub">按分区 × 逐日聚合 · 风险合成降雨(0-3)/高温(0-3)/强对流(0-2) 三轴；高/中需重点防范</div>
-{regions_html}
-<div class="note">风险由各分区代表城市官方逐日预报中的最大单日降水、72h最高气温与雷雨对流信号经透明白箱规则综合评定；
-  仅作形势研判，灾害性天气请以属地气象台预警为准。</div></div>
-
-<div class="card"><h2><span class="no">8</span>重点天气过程</h2>
-<div class="sec-sub">由分区风险自动提炼的过程清单</div>
-<ul class="proc">{proc_html}</ul></div>
-
-<div class="card"><h2><span class="no">9</span>分区逐日预报总览（官方）</h2>
-<div class="sec-sub">今明两日逐日天气与最高温 · 柱条反映今日相对降水强度</div>
-<table><thead><tr><th>分区</th><th>城市</th><th>今日最高</th><th>今日天气</th><th>明日最高</th><th>明日天气</th></tr></thead>
-<tbody>{rows}</tbody></table></div>
-
-{vent}
-
-{ml_html}
-
-<div class="card"><h2><span class="no">12</span>关注与提示</h2>
-<div class="sec-sub">按分区风险生成，红标为首要关注</div>
-<div class="foc">{foc_html}</div>
-{narr_block}</div>
-
-<footer>
-  <div class="foot">本页由 GitHub Actions 定时自动生成 · 数据来自中央气象台 NMC（含官方预报图）{vent_note} · 未经人工审核，仅供参考<br/>
-  灾害性天气请以属地气象部门发布的预报预警为准。实况/预报与官方预警在页面加载后持续自动向 NMC、国家预警中心实时追更。</div>
- </footer>
- {live_js}
- {live_forecast_js}
- {live_alarm_js}
- </body></html>""".format(
-        css=CSS, d=dstr, pub=publish, gen=ts, syn=syn, now_cards=now_cards,
-        nmc_html=nmc_html, expert_html=expert_html, alarm_html=alarm_html,
-        map_html=map_html, regions_html=regions_html,
-        rows=rows, proc_html=proc_html, foc_html=foc_html,
-        vent=vent, narr_block=narr_block, ml_html=ml_html,
-        live_js=LIVE_JS,
-        live_forecast_js=LIVE_FORECAST_JS.replace("__LIVE_CODES__", json.dumps(live_codes, ensure_ascii=False)),
-        live_alarm_js=LIVE_ALARM_JS,
-        vent_note=(" / Ventusky" if ventusky_paths else ""))
-
-    os.makedirs(site_dir, exist_ok=True)
-    out = os.path.join(site_dir, "index.html")
-    with open(out, "w", encoding="utf-8") as f:
-        f.write(html)
-    print("已生成:", out)
-    return out
 
 
 # ---------- 主流程 ----------
