@@ -462,39 +462,45 @@ def build_alarm_card(alarms, cnt, top=22):
 # 纯字符串（不经 .format），花括号为 JS 字面量；CORS 已开放(nmc.cn)，失败时保留静态兜底值。
 LIVE_JS = r"""<script>
 (function(){
+  /* 前端实时刷新 + 自动轮询：打开页面即拉取成都/重庆 NMC 实况，之后每 2 分钟再次自动拉取，
+     使发布时刻/气温等高时效字段持续追随官方最新；失败时静默保留上一次值。 */
   var CODES={"成都":"yGYHR","重庆":"UkfaS"};
   function pad(n){return (n<10?"0":"")+n;}
   function rt(x){return (x==null||isNaN(x))?"-":Math.round(x);}
   function cleanPub(p){var m=String(p||"").match(/(\d{1,2}):(\d{2})/);return m?pad(+m[1])+":"+m[2]:"-";}
-  var cards=[].slice.call(document.querySelectorAll(".city"));
-  if(!cards.length) return;
-  var remaining=cards.length, pubs=[];
-  cards.forEach(function(card){
-    var code=CODES[card.getAttribute("data-city")];
-    if(!code){remaining--;return;}
-    fetch("https://www.nmc.cn/rest/weather?stationid="+code,{headers:{"X-Requested-With":"fetch"}})
-      .then(function(r){return r.json();})
-      .then(function(d){
-        var real=(d&&d.data&&d.data.real)||{}, wea=real.weather||{}, wind=real.wind||{};
-        var tv=card.querySelector(".tval");
-        if(wea.temperature!=null&&tv) tv.textContent=rt(wea.temperature);
-        if(real.publish_time){
-          var flag=card.querySelector(".top .flag");
-          if(flag) flag.textContent="实况 "+cleanPub(real.publish_time);
-          pubs.push(real.publish_time);
-        }
-        var dt=card.querySelector(".dt");
-        if(dt){
-          var today=dt.getAttribute("data-today")||"";
-          var ws=(wind.dir!=null?(wind.dir+(wind.speed!=null?" "+wind.speed:"")):"-");
-          var hum=(wea.humidity!=null)?Math.round(wea.humidity)+"%":"-";
-          dt.innerHTML=(ws+" · 湿度 "+hum+" · 今日 "+today);
-        }
-      }).catch(function(){})
-      .then(function(){ remaining--; if(remaining<=0&&pubs.length){pubs.sort();var pv=document.querySelector(".pub-val");if(pv)pv.textContent=cleanPub(pubs[pubs.length-1]);} });
-  });
- })();
- </script>"""
+  function refresh(){
+    var cards=[].slice.call(document.querySelectorAll(".city"));
+    if(!cards.length) return;
+    var remaining=cards.length, pubs=[];
+    cards.forEach(function(card){
+      var code=CODES[card.getAttribute("data-city")];
+      if(!code){remaining--;return;}
+      fetch("https://www.nmc.cn/rest/weather?stationid="+code,{headers:{"X-Requested-With":"fetch"}})
+        .then(function(r){return r.json();})
+        .then(function(d){
+          var real=(d&&d.data&&d.data.real)||{}, wea=real.weather||{}, wind=real.wind||{};
+          var tv=card.querySelector(".tval");
+          if(wea.temperature!=null&&tv) tv.textContent=rt(wea.temperature);
+          if(real.publish_time){
+            var flag=card.querySelector(".top .flag");
+            if(flag) flag.textContent="实况 "+cleanPub(real.publish_time);
+            pubs.push(real.publish_time);
+          }
+          var dt=card.querySelector(".dt");
+          if(dt){
+            var today=dt.getAttribute("data-today")||"";
+            var ws=(wind.dir!=null?(wind.dir+(wind.speed!=null?" "+wind.speed:"")):"-");
+            var hum=(wea.humidity!=null)?Math.round(wea.humidity)+"%":"-";
+            dt.innerHTML=(ws+" · 湿度 "+hum+" · 今日 "+today);
+          }
+        }).catch(function(){})
+        .then(function(){ remaining--; if(remaining<=0&&pubs.length){pubs.sort();var pv=document.querySelector(".pub-val");if(pv)pv.textContent=cleanPub(pubs[pubs.length-1]);} });
+    });
+  }
+  refresh();
+  setInterval(refresh, 120000);
+})();
+</script>"""
 
 
 # ---------- 渲染 ----------
