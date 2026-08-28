@@ -19,6 +19,7 @@
     python3 src/generate_weather.py --out <dir>     # 输出目录，默认 ./site
 """
 import argparse, base64, json, os, re, sys, urllib.request, urllib.parse, time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 import math
 
@@ -860,28 +861,27 @@ MAP_CARD = """<div class="card"><h2><span class="no">6</span>川渝全站点实�
 
 
 def fetch_station_live(sts):
-    """生成时由服务端一次性抓取全部站点 NMC 实时实况并烘焙进页面。
+    """生成时由服务端并发抓取全部站点 NMC 实时实况并烘焙进页面。
     浏览器端因 NMC 按客户端 IP 限流(约45个后)无法逐站拉全 201 站，
-    改为服务端抓全后浏览器仅做轻量追更，规避限流。"""
+    改为服务端抓全后浏览器仅做轻量追更，规避限流。并发抓取以缩短构建时间。"""
     def get(u):
         r = urllib.request.Request(u, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
         return json.load(urllib.request.urlopen(r, timeout=6))
-    out = []
-    for s in sts:
+    def one(s):
         try:
             d = get("https://www.nmc.cn/rest/weather?stationid=" + s["code"])
             real = (d.get("data") or {}).get("real") or {}
             wea = real.get("weather") or {}
             T = wea.get("temperature")
-            if T not in (None, "", "9999", "999"):
-                info = _cond(wea.get("info", "")) or ""
-                pt = str(real.get("publish_time") or "")[-5:]
-                out.append([round(float(T), 1), info, pt])
-            else:
-                out.append(None)
+            if T in (None, "", "9999", "999"):
+                return None
+            info = _cond(wea.get("info", "")) or ""
+            pt = str(real.get("publish_time") or "")[-5:]
+            return [round(float(T), 1), info, pt]
         except Exception:
-            out.append(None)
-    return out
+            return None
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        return list(ex.map(one, sts))
 
 
 def build_map_card(fetched, stations):
