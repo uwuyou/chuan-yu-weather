@@ -1350,7 +1350,58 @@ th:first-child,td:first-child,th:nth-child(2),td:nth-child(2){text-align:left}
 .foot{font-size:11.6px;color:#8697aa;margin-top:26px;text-align:center;line-height:1.8}
 b.strong{color:var(--navy)}
 .warn-t{color:var(--red);font-weight:700}
+
+/* ===== 吸顶目录导航 & 回到顶部 ===== */
+.card{scroll-margin-top:78px}
+.sidenav{position:sticky;top:0;z-index:400;background:rgba(16,38,60,.97);
+  backdrop-filter:blur(8px);border-bottom:1px solid rgba(255,255,255,.10);
+  box-shadow:0 4px 18px rgba(10,28,46,.18)}
+.sidenav-inner{max-width:1020px;margin:0 auto;padding:10px 18px;display:flex;gap:8px;
+  overflow-x:auto;scrollbar-width:none;white-space:nowrap}
+.sidenav-inner::-webkit-scrollbar{display:none}
+.snav-item{flex:none;display:inline-flex;align-items:center;gap:7px;color:#cfe2f4;font-size:12.8px;
+  padding:6px 13px;border-radius:20px;border:1px solid rgba(255,255,255,.16);cursor:pointer;
+  transition:all .18s ease;user-select:none}
+.snav-item .n{font-weight:800;color:#7fb6e2;font-size:11.6px;font-variant-numeric:tabular-nums}
+.snav-item:hover{background:rgba(255,255,255,.12);color:#fff}
+.snav-item.active{background:linear-gradient(135deg,#3d8bc0,#2f7cb6);border-color:transparent;color:#fff;
+  box-shadow:0 3px 10px rgba(47,124,182,.35)}
+.snav-item.active .n{color:#eaf5ff}
+.totop{position:fixed;right:22px;bottom:26px;z-index:700;width:46px;height:46px;border-radius:50%;border:0;
+  background:linear-gradient(135deg,var(--navy),var(--navy2));color:#fff;font-size:19px;cursor:pointer;
+  box-shadow:0 8px 22px rgba(20,50,79,.38);opacity:0;pointer-events:none;transform:translateY(10px);
+  transition:all .26s ease;line-height:1}
+.totop.show{opacity:1;pointer-events:auto;transform:none}
+.totop:hover{background:var(--accent)}
 """
+
+NAV_JS = r"""<script>
+(function(){
+  var cards=[].slice.call(document.querySelectorAll('div.card'));
+  var inner=document.getElementById('snav-inner');
+  if(!inner||!cards.length)return;
+  cards.forEach(function(c,i){if(!c.id)c.id='sec'+(i+1);});
+  var items=[];
+  cards.forEach(function(c){
+    var h=c.querySelector('h2');if(!h)return;
+    var no=h.querySelector('.no');var n=no?no.textContent.replace(/[^0-9]/g,''):'';
+    var t=h.textContent.replace(n,'').trim()||('板块'+n);
+    var a=document.createElement('a');a.className='snav-item';a.href='#'+c.id;
+    a.innerHTML=(n?'<span class="n">'+n+'</span>':'')+'<span>'+t+'</span>';
+    a.addEventListener('click',function(e){e.preventDefault();go(c);mark(c);});
+    inner.appendChild(a);items.push({a:a,el:c});
+  });
+  function go(el){window.scrollTo({top:el.getBoundingClientRect().top+window.pageYOffset-66,behavior:'smooth'});}
+  function mark(el){items.forEach(function(o){o.a.classList.toggle('active',o.el===el);});}
+  function spy(){var o=78,cur=null;cards.forEach(function(c){if(c.getBoundingClientRect().top<=o)cur=c;});mark(cur);}
+  window.addEventListener('scroll',spy,{passive:true});spy();
+  var tb=document.getElementById('totop');if(tb){
+    function onSc(){tb.classList.toggle('show',window.pageYOffset>480);}
+    window.addEventListener('scroll',onSc,{passive:true});onSc();
+    tb.addEventListener('click',function(){window.scrollTo({top:0,behavior:'smooth'});});
+  }
+})();
+</script>"""
 
 
 def esc(s):
@@ -1737,7 +1788,9 @@ def render(fetched, ventusky_paths, nmc_charts, narr, site_dir, generated, alarm
    <html lang="zh">
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>川渝天气展望 · 分区风险分析报告 {d}</title><style>{css}</style></head>
-<body><div class="wrap">
+<body>
+<nav id="snav" class="sidenav" aria-label="板块导航"><div class="sidenav-inner" id="snav-inner"></div></nav>
+<div class="wrap">
 <div class="hero">
   <span class="kicker">Sichuan &amp; Chongqing Weather Outlook</span>
   <h1>川渝天气展望 · 分区风险分析报告</h1>
@@ -1793,6 +1846,8 @@ def render(fetched, ventusky_paths, nmc_charts, narr, site_dir, generated, alarm
  {live_js}
  {live_forecast_js}
  {live_alarm_js}
+ {nav_js}
+ <button class="totop" id="totop" aria-label="回到顶部">↑</button>
  </body></html>""".format(
         css=CSS, d=dstr, pub=publish, gen=ts, syn=syn, now_cards=now_cards,
         nmc_html=nmc_html, expert_html=expert_html, alarm_html=alarm_html,
@@ -1802,6 +1857,7 @@ def render(fetched, ventusky_paths, nmc_charts, narr, site_dir, generated, alarm
         live_js=LIVE_JS,
         live_forecast_js=LIVE_FORECAST_JS.replace("__LIVE_CODES__", json.dumps(live_codes, ensure_ascii=False)),
         live_alarm_js=LIVE_ALARM_JS,
+        nav_js=NAV_JS,
         vent_note=(" / Ventusky" if ventusky_paths else ""))
 
     os.makedirs(site_dir, exist_ok=True)
