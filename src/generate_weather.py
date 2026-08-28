@@ -82,24 +82,24 @@ def fetch_city(name, pinyin):
     for dd in ((data.get("predict") or {}).get("detail") or [])[:4]:
         day = dd.get("day", {}).get("weather", {}) or {}
         night = dd.get("night", {}).get("weather", {}) or {}
-        info = day.get("info", "")
-        ninfo = night.get("info", "")
+        info = _cond(day.get("info"))
+        ninfo = _cond(night.get("info"))
         if ninfo and ninfo != info:
             info = (info + "转" + ninfo) if info else ninfo
         days.append({
             "date": dd.get("date", ""),
             "info": info or "-",
-            "tmax": _num(day.get("temperature")),
-            "tmin": _num(night.get("temperature")),
-            "precip": _num(dd.get("precipitation")),
+            "tmax": _temp(day.get("temperature")),
+            "tmin": _temp(night.get("temperature")),
+            "precip": _precip(dd.get("precipitation")),
         })
     return {
         "name": name,
         "publish": real.get("publish_time", ""),
-        "now_temp": weat.get("temperature"),
+        "now_temp": _temp(weat.get("temperature")),
         "now_rain": weat.get("rain"),
-        "now_info": weat.get("info", ""),
-        "humidity": weat.get("humidity"),
+        "now_info": _cond(weat.get("info", "")),
+        "humidity": _hum(weat.get("humidity")),
         "wind": (real.get("wind") or {}).get("direct", ""),
         "days": days,
     }
@@ -110,6 +110,36 @@ def _num(v):
         return float(v)
     except (TypeError, ValueError):
         return None
+
+
+def _temp(v):
+    """气温清洗：丢弃 NMC 缺测哨兵值(9999)与越界数值，返回合理气温(±60℃)或 None。"""
+    v = _num(v)
+    if v is None:
+        return None
+    return v if -60 <= v <= 60 else None
+
+
+def _precip(v):
+    """降水清洗：丢弃哨兵值(9999)与超出合理范围的毫米数，返回合理值或 None。"""
+    v = _num(v)
+    if v is None or v < 0 or v > 800 or v == 9999:
+        return None
+    return v
+
+
+def _hum(v):
+    """湿度清洗：返回 0-100 的合理值，否则 None。"""
+    v = _num(v)
+    if v is None or v < 0 or v > 100:
+        return None
+    return v
+
+
+def _cond(s):
+    """天气现象清洗：NMC 对缺测天气编码同样返回 9999，视为空串。"""
+    s = (s or "").strip()
+    return "" if s in ("9999", "999", "0", "-") else s
 
 
 # ---------- 分区聚合 / 多维风险引擎（透明白箱启发式）----------
@@ -471,7 +501,7 @@ def build_alarm_card(alarms, cnt, top=22):
 
 # ---------- 今日最高温分布 · 地图（Leaflet + 多底图回退） ----------
 MAP_CARD = """<div class="card"><h2><span class="no">6</span>今日最高温分布 · 地图</h2>
-<div class="sec-sub">川渝代表城市 今日最高温示意（点色/点径按气温分级） · 悬浮查看分区与当前实况</div>
+<div class="sec-sub">川渝代表城市 当日最高温示意（预报最高缺测时以当前实况近似） · 悬浮查分区与实况</div>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
 <style>
 #heatmax{height:470px;width:100%;border-radius:12px;overflow:hidden;border:1px solid var(--line);background:#e9edf2}
@@ -503,7 +533,7 @@ MAP_CARD = """<div class="card"><h2><span class="no">6</span>今日最高温分�
   DATA.forEach(function(p){
     L.circleMarker([p.lat,p.lng],{radius:radOf(p.tmax),color:'#fff',weight:2,fillColor:colorOf(p.tmax),fillOpacity:0.9})
       .addTo(map)
-      .bindPopup('<b>'+p.city+'</b>（'+p.region+'）<br/>今日最高 <b style="color:#c23b2e">'+(p.tmax!=null?p.tmax+'℃':'—')+'</b><br/>当前实况 '+(p.now!=null?p.now+'℃':'—'));
+      .bindPopup('<b>'+p.city+'</b>（'+p.region+'）<br/>当日最高 <b style="color:#c23b2e">'+(p.tmax!=null?p.tmax+'℃':'—')+'</b>'+(p.hasFc?'':'（以当前实况近似）')+'<br/>当前实况 '+(p.now!=null?p.now+'℃':'—'));
   });
 })();
 </script>
@@ -518,8 +548,12 @@ def build_map_card(fetched):
             if not c or nm not in CITY_COORDS:
                 continue
             d0 = (c["days"] or [{}])[0]
+            fc_max = d0.get("tmax")          # 今日预报最高（可能缺测=9999已清为None）
+            now = c.get("now_temp")          # 当前实况
+            # 截止目前的当日最高：预报最高有效则用之，否则以当前实况近似
+            val = fc_max if fc_max is not None else now
             pts.append({"city": nm, "lat": CITY_COORDS[nm][0], "lng": CITY_COORDS[nm][1],
-                        "tmax": d0.get("tmax"), "now": c.get("now_temp"), "region": r["name"]})
+                        "tmax": val, "now": now, "region": r["name"], "hasFc": fc_max is not None})
     if not pts:
         return ""
     return MAP_CARD.replace("__DATA__", json.dumps(pts, ensure_ascii=False))
@@ -546,8 +580,8 @@ LIVE_JS = r"""<script>
         .then(function(r){return r.json();})
         .then(function(d){
           var real=(d&&d.data&&d.data.real)||{}, wea=real.weather||{}, wind=real.wind||{};
-          var tv=card.querySelector(".tval");
-          if(wea.temperature!=null&&tv) tv.textContent=rt(wea.temperature);
+          var tv=card.querySelector(".tval"), T=wea.temperature;
+          if(tv && T!=null && Math.abs(T)<=60) tv.textContent=rt(T);
           if(real.publish_time){
             var flag=card.querySelector(".top .flag");
             if(flag) flag.textContent="实况 "+cleanPub(real.publish_time);
@@ -556,8 +590,9 @@ LIVE_JS = r"""<script>
           var dt=card.querySelector(".dt");
           if(dt){
             var today=dt.getAttribute("data-today")||"";
-            var ws=(wind.dir!=null?(wind.dir+(wind.speed!=null?" "+wind.speed:"")):"-");
-            var hum=(wea.humidity!=null)?Math.round(wea.humidity)+"%":"-";
+            var sp=wind.speed, h=wea.humidity;
+            var ws=(wind.dir!=null ? wind.dir+(sp!=null&&sp>=0&&sp<100?" "+sp:"") : "-");
+            var hum=(h!=null&&h>=0&&h<=100)?Math.round(h)+"%":"-";
             dt.innerHTML=(ws+" · 湿度 "+hum+" · 今日 "+today);
           }
         }).catch(function(){})
