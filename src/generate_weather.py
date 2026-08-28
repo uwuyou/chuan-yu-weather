@@ -706,7 +706,7 @@ MAP_CARD = """<div class="card"><h2><span class="no">6</span>川渝全站点实�
 <span class="hl"><i style="background:#58b3e0"></i>25–29.9</span>
 <span class="hl"><i style="background:#3a79c2"></i>&lt;25</span>
 <span class="hl"><i style="background:#8aa0b5"></i>缺测</span></div>
-<div class="layer-note">底图：高德（无需代理）· 小圆点=川渝各站点实时实况（逐点拉取 NMC 实况着色）· 大圆=七分区代表城区今日预报最高温。 <span class="live-stat" id="liveStat">实况更新中…</span></div>
+<div class="layer-note">底图：高德（无需代理）· 小圆点=川渝各站点实时实况（生成时服务端抓取·浏览器追更）· 大圆=七分区代表城区今日预报最高温。 <span class="live-stat" id="liveStat">实况更新中…</span> · <span class="live-stat" id="liveTs"></span></div>
 <script src="https://cdn.staticfile.org/leaflet/1.9.4/leaflet.min.js"></script>
 <script>
 (function(){
@@ -741,11 +741,20 @@ MAP_CARD = """<div class="card"><h2><span class="no">6</span>川渝全站点实�
 
   /* 图层2：川渝全站点实时实况 */
   var live=[];
-  STATIONS.forEach(function(s){
-    live.push(L.circleMarker([s.lat,s.lng],{radius:5,color:'#fff',weight:1,fillColor:'#8aa0b5',fillOpacity:0.9,riseOnHover:true})
-      .bindPopup('<b>'+s.city+'</b>（'+s.province+'）<br/>实况——'));
+  var LIVE=__LIVE__;
+  STATIONS.forEach(function(s,i){
+    var o=LIVE&&LIVE[i], T=o?o[0]:null;
+    var mk=L.circleMarker([s.lat,s.lng],{radius:(T!=null?radOf(T):5),color:'#fff',weight:1,
+      fillColor:(T!=null?colorOf(T):'#8aa0b5'),fillOpacity:0.9,riseOnHover:true});
+    mk.bindPopup(o&&T!=null
+      ?('<b>'+s.city+'</b>（'+s.province+'）<br/>实况 <b style="color:#c23b2e">'+Math.round(T)+'℃</b>'+(o[1]?' · '+o[1]:'')+'<br/>发布 '+(o[2]||'—'))
+      :('<b>'+s.city+'</b>（'+s.province+'）<br/>实况——'));
+    live.push(mk);
   });
   var liveLayer=L.layerGroup(live).addTo(map);
+
+  function stamp(txt){var e=document.getElementById('liveTs'); if(e)e.textContent=txt;}
+  stamp('实况由生成时服务端一次抓取（'+__LIVE_TS__+'），浏览器每10分钟轻量追更');
 
   L.control.layers({'高德路网':road,'高德卫星':sat},
     {'代表城区(今日预报最高)':repLayer,'川渝全站点(实时实况)':liveLayer}, {collapsed:false}).addTo(map);
@@ -773,7 +782,7 @@ MAP_CARD = """<div class="card"><h2><span class="no">6</span>川渝全站点实�
               mk.setPopupContent('<b>'+s.city+'</b>（'+s.province+'）<br/>实况暂缺（数据缺测）');
             }
           }).catch(function(){})
-          .then(function(){ done++; if(statEl) statEl.textContent='实况 '+(done<tasks.length?'更新中 '+done+'/'+tasks.length:'加载完成 '+ok+'/'+tasks.length); pump(); });
+          .then(function(){ done++; if(statEl) statEl.textContent='实况 '+(done<tasks.length?'更新中 '+done+'/'+tasks.length:'加载完成 '+ok+'/'+tasks.length); if(done>=tasks.length) stamp('最后刷新 '+new Date().toTimeString().slice(0,8)); pump(); });
       })(i);
     }
     for(var k=0;k<6;k++){
@@ -786,6 +795,31 @@ MAP_CARD = """<div class="card"><h2><span class="no">6</span>川渝全站点实�
 })();
 </script>
 </div>"""
+
+
+def fetch_station_live(sts):
+    """生成时由服务端一次性抓取全部站点 NMC 实时实况并烘焙进页面。
+    浏览器端因 NMC 按客户端 IP 限流(约45个后)无法逐站拉全 201 站，
+    改为服务端抓全后浏览器仅做轻量追更，规避限流。"""
+    def get(u):
+        r = urllib.request.Request(u, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+        return json.load(urllib.request.urlopen(r, timeout=6))
+    out = []
+    for s in sts:
+        try:
+            d = get("https://www.nmc.cn/rest/weather?stationid=" + s["code"])
+            real = (d.get("data") or {}).get("real") or {}
+            wea = real.get("weather") or {}
+            T = wea.get("temperature")
+            if T not in (None, "", "9999", "999"):
+                info = _cond(wea.get("info", "")) or ""
+                pt = str(real.get("publish_time") or "")[-5:]
+                out.append([round(float(T), 1), info, pt])
+            else:
+                out.append(None)
+        except Exception:
+            out.append(None)
+    return out
 
 
 def build_map_card(fetched, stations):
@@ -809,9 +843,13 @@ def build_map_card(fetched, stations):
         return ""
     s_cnt = sum(1 for s in sts if "四川" in s["province"])
     c_cnt = sum(1 for s in sts if "重庆" in s["province"])
+    live_obs = fetch_station_live(sts)
+    live_ts = datetime.now().strftime("%H:%M")
     return (MAP_CARD
             .replace("__STATIONS__", json.dumps(sts, ensure_ascii=False))
             .replace("__DATA__", json.dumps(pts, ensure_ascii=False))
+            .replace("__LIVE__", json.dumps(live_obs, ensure_ascii=False))
+            .replace("__LIVE_TS__", json.dumps(live_ts, ensure_ascii=False))
             .replace("__SC_S__", str(s_cnt)).replace("__SC_C__", str(c_cnt)))
 
 
