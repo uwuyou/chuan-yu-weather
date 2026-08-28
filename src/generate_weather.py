@@ -1548,7 +1548,7 @@ def render(fetched, ventusky_paths, nmc_charts, narr, site_dir, generated, alarm
                 "<div class='grid'>{b}</div>"
                 "<div class='note'>实况要素面交叉印证，具体取值与结论以中央气象台及属地气象部门官方预报为准。</div></div>").format(b=blocks)
 
-    narr_block = ("<div class='ep'>{narr}</div>").format(narr=narr or "（未启用 LLM 润色，采用规则化概览，数据取官方实时）")
+    narr_block = ""  # 已按需求移除卡片11的"未启用 LLM 润色…"说明段落
 
     html = """<!DOCTYPE html>
 <html lang="zh">
