@@ -1820,6 +1820,262 @@ ML_STATIONS = [["成都", 30.67, 104.07], ["雅安", 30.01, 103.00], ["广元", 
 ML_LV = [925, 850, 700, 500, 200, 100]
 
 
+# ---------- 新增：区域加密格点 → 槽/脊/高低压/切变线/锋面等天气系统粗识别 ----------
+# 在代表站之外再布设覆盖川渝及周边的中尺度矩形格点，读取海平面气压、850/700/500hPa 位势高度、
+# 850hPa 温度、925/850hPa 风场；据此用空间场（局地极值、梯度、风向辐合）启发式识别天气系统。
+ML_SYS_LAT = [27.0, 29.0, 31.0, 33.0, 35.0]
+ML_SYS_LON = [100.0, 102.0, 104.0, 106.0, 108.0, 110.0]
+_SYSH = [("mlp", "pressure_msl"), ("H500", "geopotential_height_500hPa"),
+         ("H700", "geopotential_height_700hPa"), ("H850", "geopotential_height_850hPa"),
+         ("T850", "temperature_850hPa"), ("WS925", "wind_speed_925hPa"),
+         ("WD925", "wind_direction_925hPa"), ("WS850", "wind_speed_850hPa"),
+         ("WD850", "wind_direction_850hPa")]
+
+
+def _sys_grid():
+    """拉取区域加密格点的空间读场，返回 (F, ok)。F 为 {key: [[..]] 2D}，ok 为成功格点数。"""
+    nla, nlo = len(ML_SYS_LAT), len(ML_SYS_LON)
+
+    def mk():
+        return [[None] * nlo for _ in range(nla)]
+
+    F = dict((k, mk()) for k, _ in _SYSH)
+    F["_ele"] = mk()
+    hv = [h for _, h in _SYSH]
+
+    def cell(i, j):
+        q = urllib.parse.urlencode({
+            "latitude": "%.2f" % ML_SYS_LAT[i], "longitude": "%.2f" % ML_SYS_LON[j],
+            "hourly": ",".join(hv), "pressure_level": "500,700,850,925",
+            "forecast_hours": "2", "timezone": "Asia/Shanghai"})
+        d = json.loads(http_get("https://api.open-meteo.com/v1/forecast?" + q, timeout=20).decode())
+        ho = d.get("hourly") or {}
+        out = {"elev": float(d["elevation"]) if d.get("elevation") is not None else 0.0}
+        for hk in hv:
+            a = ho.get(hk) or []
+            out[hk] = (float(a[0]) if a and a[0] is not None else None)
+        return out
+
+    cells = [(i, j) for i in range(nla) for j in range(nlo)]
+    ok = 0
+    with ThreadPoolExecutor(max_workers=12) as ex:
+        mp = {ex.submit(cell, i, j): (i, j) for i, j in cells}
+        for fut in as_completed(mp):
+            i, j = mp[fut]
+            try:
+                d = fut.result()
+            except Exception:
+                continue
+            for k, hk in _SYSH:
+                if d.get(hk) is not None:
+                    F[k][i][j] = d[hk]
+            F["_ele"][i][j] = d.get("elev", 0.0)
+            ok += 1
+    return (F, ok) if ok >= 12 else (None, ok)
+
+
+def _wind_name(deg):
+    names = ["北", "东北", "东", "东南", "南", "西南", "西", "西北"]
+    return names[int((deg % 360 + 22.5) // 45) % 8] + "风"
+
+
+def _circ_mean(deg_list):
+    if not deg_list:
+        return None
+    x = sum(math.cos(math.radians(d)) for d in deg_list)
+    y = sum(math.sin(math.radians(d)) for d in deg_list)
+    return (math.degrees(math.atan2(y, x)) + 360) % 360
+
+
+def _ang_diff(a, b):
+    d = abs(a - b) % 360
+    return d if d <= 180 else 360 - d
+
+
+def _pos(la, lo):
+    """相对盆地中心(30.5N,105E)的粗略方位名。"""
+    ang = (math.degrees(math.atan2(lo - 105.0, la - 30.5)) + 360) % 360
+    return ["正北", "东北", "正东", "东南", "正南", "西南", "正西", "西北"][int((ang + 22.5) // 45) % 8]
+
+
+def _analyze_weather_systems():
+    """对加密格点做天气系统粗识别，返回 {key: html片段}；格点不足时返回空 dict。"""
+    F, ok = _sys_grid()
+    if F is None:
+        return {}
+    nla, nlo = len(ML_SYS_LAT), len(ML_SYS_LON)
+    out = {}
+
+    def m2(arr):
+        v = [x for row in arr for x in row if x is not None]
+        return (sum(v) / len(v)) if v else None
+
+    def reg(arr, ir, jr):
+        v = [arr[i][j] for i in ir for j in jr if arr[i][j] is not None]
+        return (sum(v) / len(v)) if v else None
+
+    def localmin(arr, i, j):
+        if arr[i][j] is None:
+            return False
+        v = arr[i][j]
+        for di in (-1, 0, 1):
+            for dj in (-1, 0, 1):
+                if di == 0 and dj == 0:
+                    continue
+                ni, nj = i + di, j + dj
+                if 0 <= ni < nla and 0 <= nj < nlo and arr[ni][nj] is not None and arr[ni][nj] <= v:
+                    return False
+        return True
+
+    def localmax(arr, i, j):
+        if arr[i][j] is None:
+            return False
+        v = arr[i][j]
+        for di in (-1, 0, 1):
+            for dj in (-1, 0, 1):
+                if di == 0 and dj == 0:
+                    continue
+                ni, nj = i + di, j + dj
+                if 0 <= ni < nla and 0 <= nj < nlo and arr[ni][nj] is not None and arr[ni][nj] >= v:
+                    return False
+        return True
+
+    # ---- 地面（海平面）气压系统：闭合低压 / 高压中心（仅低海拔格点，规避高原气压还原假高压） ----
+    ele = F.get("_ele")
+
+    def is_lowland(i, j):
+        # 850hPa 已被格点遮蔽（高原无850层）则视为非盆地格点，不用作地面气压判据
+        if F["T850"][i][j] is None:
+            return False
+        return (ele is None) or (ele[i][j] <= 1200)
+
+    if m2(F["mlp"]) is not None:
+        pts = [(i, j, F["mlp"][i][j]) for i in range(nla) for j in range(nlo)
+               if F["mlp"][i][j] is not None and is_lowland(i, j)]
+        if len(pts) >= 6:
+            pmin = min(p[2] for p in pts); pmax = max(p[2] for p in pts); pmean = sum(p[2] for p in pts) / len(pts)
+            lows = [(i, j, F["mlp"][i][j]) for i in range(nla) for j in range(nlo) if F["mlp"][i][j] is not None and is_lowland(i, j) and localmin(F["mlp"], i, j)]
+            highs = [(i, j, F["mlp"][i][j]) for i in range(nla) for j in range(nlo) if F["mlp"][i][j] is not None and is_lowland(i, j) and localmax(F["mlp"], i, j)]
+            lows = [p for p in lows if p[2] < pmean - 2]
+            highs = [p for p in highs if p[2] > pmean + 2]
+            tx = "海平面气压区域平均约 <b>%d hPa</b>（%d～%d hPa）。" % (pmean, pmin, pmax)
+            if lows:
+                i, j, v = min(lows, key=lambda p: p[2])
+                tx += "格网内存在<b>闭合低压</b>中心（约 <b>%d hPa</b>，位于盆地%s），低层辐合利于降水或对流。" % (v, _pos(ML_SYS_LAT[i], ML_SYS_LON[j]))
+            else:
+                tx += "未见明显闭合低压中心，地面气压梯度较缓，近地面辐合抬升条件一般。"
+            if highs:
+                i, j, v = max(highs, key=lambda p: p[2])
+                tx += "同时在盆地%s存在<b>闭合高压</b>中心（约 <b>%d hPa</b>），近地面以下沉、晴稳为主。" % (_pos(ML_SYS_LAT[i], ML_SYS_LON[j]), v)
+            out["sfc"] = tx
+
+    # ---- 500 hPa：槽 / 脊 / 高/低压 + 副高(5880领域范围) ----
+    if m2(F["H500"]) is not None:
+        Hc = reg(F["H500"], [1, 2], [2, 3]) or 0
+        NW = reg(F["H500"], [2, 3, 4], [0, 1, 2]); NE = reg(F["H500"], [2, 3, 4], [3, 4, 5])
+        SW = reg(F["H500"], [0, 1], [0, 1, 2]); SE = reg(F["H500"], [0, 1], [3, 4, 5])
+        E = (NE + SE) / 2 if (NE is not None and SE is not None) else None
+        W = (NW + SW) / 2 if (NW is not None and SW is not None) else None
+        N = (NW + NE) / 2 if (NW is not None and NE is not None) else None
+        S = (SW + SE) / 2 if (SW is not None and SE is not None) else None
+        hi = [v for v in (NW, NE, SW, SE) if v is not None]
+        mx = max(hi) if hi else None; mn = min(hi) if hi else None
+        hp = [F["H500"][i][j] for i in range(nla) for j in range(nlo) if F["H500"][i][j] is not None]
+        vcnt = len(hp)
+        frac = (sum(1 for x in hp if x >= 5880) / vcnt * 100) if vcnt else 0
+        if frac >= 70:
+            tp = "受<b>大范围高压（副高/大陆高压）</b>面状控制，≥5880线覆盖约 <b>%d%%</b>，局地槽脊不显著" % frac
+            note = ""
+        elif mx is not None and Hc - mx >= 60:
+            tp = "盆地500hPa偏<b>高值，受高压脊/高压区控制</b>"
+            note = ("区域约 <b>%d%%</b> 格点≥5880线，副高对盆地有明显控制影响。" % frac) if frac else ""
+        elif mn is not None and mn - Hc >= 60:
+            tp = "盆地500hPa处于<b>低值（低槽/低值区）</b>"
+            note = ("副高5880线主体偏东南退，仅约 <b>%d%%</b> 格点≥5880线。" % frac) if frac < 40 else ""
+        elif W is not None and E is not None and W - E >= 60:
+            tp = "高度<b>西高东低</b>，盆地处于<b>槽前</b>西南暖湿气流区"
+            note = ("约 <b>%d%%</b> 格点≥5880线，副高5880线大致在盆地边缘附近。" % frac) if frac < 40 else ""
+        elif E is not None and W is not None and E - W >= 60:
+            tp = "高度<b>东高西低</b>，盆地处于<b>槽后/高压脊前</b>西北气流区"
+            note = ""
+        elif N is not None and S is not None and N - S >= 60:
+            tp = "高度<b>北高南低</b>，呈典型西风带纬向引导"
+            note = ""
+        else:
+            tp = "环流<b>较平直</b>，无明显强槽脊"
+            note = ("盆地未明显落入5880线所围副高范围。" if frac < 10 else ("约 <b>%d%%</b> 格点≥5880线，副高5880线紧邻或逼近盆地。" % frac))
+        tx = "盆地500hPa位势高度平均约 <b>%d gpm</b>，判读：%s。" % (Hc, tp)
+        if note:
+            tx += note
+        out["h500"] = tx
+
+    # ---- 700 hPa：低涡 / 切变 / 中空暖脊 ----
+    if m2(F["H700"]) is not None:
+        Hc7 = reg(F["H700"], [1, 2], [2, 3])
+        o7 = []
+        for ir, jr in (([0, 1], [0, 1, 2]), ([0, 1], [3, 4, 5]), ([2, 3, 4], [0, 1, 2]), ([2, 3, 4], [3, 4, 5])):
+            v = reg(F["H700"], ir, jr)
+            if v is not None:
+                o7.append(v)
+        if o7 and Hc7 is not None:
+            if min(o7) - Hc7 >= 45:
+                out["h700"] = "700hPa盆地为<b>低值（低涡/切变）中心</b>，中心高度约 <b>%d gpm</b>，低层辐合显著，是本站区域降水/对流的动力系统。" % Hc7
+            elif Hc7 - max(o7) >= 45:
+                out["h700"] = "700hPa盆地偏<b>高值（中空暖脊/高压）</b>，高度约 <b>%d gpm</b>，中低空以下沉、晴稳为主。" % Hc7
+            else:
+                out["h700"] = "700hPa位势高度在盆地约 <b>%d gpm</b>，与四周差异不大，无显著低涡或暖脊特征。" % Hc7
+
+    # ---- 850 hPa 温度锋面 ----
+    if m2(F["T850"]) is not None:
+        TN = reg(F["T850"], [2, 3, 4], range(nlo)); TS = reg(F["T850"], [0, 1], range(nlo))
+        if TN is not None and TS is not None:
+            dT = TS - TN
+            frow = None
+            best = -1
+            for i in range(1, nla):
+                r = [F["T850"][i][j] - F["T850"][i - 1][j] for j in range(nlo)
+                     if F["T850"][i][j] is not None and F["T850"][i - 1][j] is not None]
+                if r:
+                    m = abs(sum(r) / len(r))
+                    if m > best:
+                        best = m; frow = i
+            n_wd = [F["WD850"][i][j] for i in range(2, nla) for j in range(nlo) if F["WD850"][i][j] is not None]
+            s_wd = [F["WD850"][i][j] for i in range(2) for j in range(nlo) if F["WD850"][i][j] is not None]
+            tx = "850hPa平均温度<b>北约%.1f℃、南约%.1f℃</b>，南北温差约 <b>%.1f℃</b>。" % (TN, TS, dT)
+            if dT >= 8:
+                parts = ["存在<b>明显温度锋区</b>，锋面大致位于约 %d°N 一线" % ML_SYS_LAT[frow]]
+                if n_wd:
+                    nw = _circ_mean(n_wd)
+                    if nw is not None and (270 <= nw <= 360 or 0 <= nw <= 90):
+                        parts.append("锋后（北侧）为%s（%d°），属<b>冷锋/冷空气南下</b>配置，易激发降温与强对流" % (_wind_name(nw), nw))
+                if s_wd:
+                    sw = _circ_mean(s_wd)
+                    if sw is not None and 180 <= sw <= 270:
+                        parts.append("锋前（南侧）为%s暖湿输送，供需条件较好" % _wind_name(sw))
+                tx += "，".join(parts) + "。"
+            else:
+                tx += "南北温差不大，<b>无明显锋面</b>，850hPa温度场较均匀。"
+            out["front"] = tx
+
+    # ---- 850 hPa 切变线（风向辐合） ----
+    if m2(F["WD850"]) is not None:
+        Wd = [F["WD850"][i][j] for i in (1, 2) for j in (0, 1, 2) if F["WD850"][i][j] is not None]
+        Ed = [F["WD850"][i][j] for i in (1, 2) for j in (3, 4, 5) if F["WD850"][i][j] is not None]
+        Sd = [F["WD850"][i][j] for i in (0, 1) for j in range(nlo) if F["WD850"][i][j] is not None]
+        Nd = [F["WD850"][i][j] for i in (3, 4) for j in range(nlo) if F["WD850"][i][j] is not None]
+        parts = []
+        if Wd and Ed:
+            wm, em = _circ_mean(Wd), _circ_mean(Ed)
+            if wm is not None and em is not None and _ang_diff(wm, em) >= 120:
+                parts.append("850hPa盆地<b>东西两侧风向辐合</b>（西侧%s、东侧%s），存在<b>切变/辐合线</b>，大致沿105°E一线，是触发带状降水的关键系统" % (_wind_name(wm), _wind_name(em)))
+        if Sd and Nd:
+            sm, nm = _circ_mean(Sd), _circ_mean(Nd)
+            if sm is not None and nm is not None and _ang_diff(sm, nm) >= 120:
+                parts.append("南北风向<b>切变</b>明显（南侧%s、北侧%s），利于低层辐合抬升与对流组织化" % (_wind_name(sm), _wind_name(nm)))
+        out["shear"] = ("，".join(parts) + "。") if parts else "850 hPa 环流风向过渡较平缓，<b>未见明显切变线</b>，辐合抬升条件一般。"
+    return out
+
+
 def build_multilevel():
     """多层次高空与地面形势研读：A.官方NMC实况分析图(SFC~100hPa)；B.公开多层格点读场(7-8代表站区域平均)。"""
     # ---- A. 官方高空实况分析图：SFC/925/850/700/500/200/100 ----
@@ -1980,10 +2236,31 @@ def build_multilevel():
         if omit:
             read.append(Blk("说明", "以下代表站读场未取到：" + "、".join(omit) + "，结果以其余站点区域平均为准。"))
 
-    read_html = "<div class='ml-read'>%s</div>" % "".join(read)
+    # ---- C. 天气系统粗识别：槽/脊/高低压/切变线/锋面（区域加密格点空间场） ----
+    sys_read = ""
+    try:
+        sysd = _analyze_weather_systems()
+    except Exception:
+        sysd = {}
+    if sysd:
+        order = [("sfc", "地面气压系统（海平面气压场）"),
+                 ("h500", "500 hPa 高低压与槽脊（环流型考察）"),
+                 ("h700", "700 hPa 低涡 / 暖脊"),
+                 ("front", "850 hPa 温度锋面"),
+                 ("shear", "850 hPa 切变线")]
+        cls = []
+        for k, t in order:
+            if k in sysd:
+                cls.append(Blk(t, sysd[k]))
+        head = ("<div class='ml-blk'><b>天气系统识别（加密格点空间场粗判）</b>"
+                "<p>基于川渝及周边 %d×%d 格点的空间读场，对<b>槽、脊、高/低压、切变线、锋面</b>作启发式识别，"
+                "供与上方 NMC 官方实况分析图横向对照（结果随加密格点质量波动，供参考）。</p></div>"
+                % (len(ML_SYS_LAT), len(ML_SYS_LON)))
+        sys_read = head + "".join(cls)
+    read_html = "<div class='ml-read'>%s%s</div>" % (sys_read, "".join(read))
 
     return """<div class="card" id="mlcard"><h2><span class="no">11</span>多层次高空与地面形势研读（SFC~100hPa）</h2>
-<div class="sec-sub">NMC官方实况分析图 × 公开多层格点垂直读场 · 自下而上解读川渝垂直方向天气配置</div>
+<div class="sec-sub">NMC官方实况分析图 × 公开多层格点读场 · 自下而上解读川渝垂直配置，并识别槽/脊/高/低压/切变线/锋面</div>
 __MLREAD____MLFIGS__
 <style>
 .ml-read{margin:6px 0 14px}
