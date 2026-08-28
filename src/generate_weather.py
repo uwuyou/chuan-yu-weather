@@ -465,6 +465,16 @@ th:first-child,td:first-child,th:nth-child(2),td:nth-child(2){text-align:left}
 .foc .f.red b{color:#a63a2b}
 .ep{background:linear-gradient(180deg,#f4f8fc,#fafcfe);border:1px solid var(--line);border-radius:12px;
   padding:12px 15px;font-size:13.6px;color:#31506e;white-space:pre-wrap}
+/* 形势解读（专家视角） */
+.expert{display:flex;flex-direction:column;gap:11px;margin-top:4px}
+.expert-title{font-size:15.5px;font-weight:800;color:#0f2c47;letter-spacing:.2px;
+  padding:11px 14px;border-left:4px solid var(--accent);background:linear-gradient(180deg,#f2f7fb,#f8fbfe);
+  border-radius:0 9px 9px 0;margin-bottom:2px}
+.echunk{background:#fbfdfe;border:1px solid var(--line);border-radius:10px;padding:9px 13px;font-size:13.2px;
+  line-height:1.8;color:#37506a}
+.echunk b{color:#0f2c47;margin-right:4px;font-weight:700}
+.echunk .hl{color:var(--red);font-weight:700}
+.echunk .ok{color:var(--green);font-weight:700}
 .note{background:#fff8ea;border:1px solid #f0dca8;color:#7a5b12;border-radius:10px;padding:10px 14px;
   font-size:12.3px;margin-top:14px}
 .foot{font-size:11.6px;color:#8697aa;margin-top:26px;text-align:center;line-height:1.8}
@@ -499,6 +509,137 @@ def _clean_cond(v):
     return str(v).strip()
 
 
+# ---------- 形势解读（专家视角，数据驱动自动生成）----------
+def build_expert(fetched):
+    """按 weather-analyst 范式，从官方逐站数据自动生成『形势→实况→演变→
+    区域→趋势→提示』的专家叙事。返回 (title, [(tag, text), ...])"""
+    profiles = []
+    obs_hot, obs_cool = None, None
+    for nm, c in fetched.items():
+        t = c.get("now_temp")
+        if t is None:
+            continue
+        if obs_hot is None or t > obs_hot[1]:
+            obs_hot = (nm, t)
+        if obs_cool is None or (t < obs_cool[1] and nm in ("广元", "绵阳", "康定")):
+            obs_cool = (nm, t)
+    for r in REGIONS:
+        rc = [fetched[n] for n, _ in r["cities"] if n in fetched]
+        if not rc:
+            continue
+        an = region_analysis(rc)
+        risk = region_risk(r["axis"], an)
+        dim0 = [_day_dim(c, 0) for c in rc]
+        dim1 = [_day_dim(c, 1) for c in rc]
+        t0 = max((d["tmax"] or 0) for d in dim0)
+        t1 = max((d["tmax"] or 0) for d in dim1)
+        p0 = max((d["precip"] or 0) for d in dim0)
+        p1 = max((d["precip"] or 0) for d in dim1)
+        profiles.append({"name": r["name"], "an": an, "risk": risk,
+                         "t0": t0, "t1": t1, "p0": p0, "p1": p1,
+                         "maxt": max(t0, t1), "maxp": max(p0, p1),
+                         "hot_now": t0 >= 35,
+                         "conv": any(d["cp"] >= 2 for d in dim0),
+                         "rain_now": p0 >= 25 or an["rp"] >= 2})
+    hot = [p for p in profiles if p["hot_now"]]
+    rain = [p for p in profiles if p["rain_now"] or p["maxp"] >= 25]
+    conv = [p for p in profiles if p["conv"]]
+
+    def _names(ps):
+        seen = set()
+        out = []
+        for p in ps:
+            if p["name"] not in seen:
+                seen.add(p["name"])
+                out.append(p["name"])
+        return "、".join(out) or "盆地大部"
+
+    # ---- ① 形势背景
+    back = []
+    if hot and rain:
+        back.append("副热带高压与大陆高压对盆地大部仍具控场，为%s提供晴热背景" % _names(hot))
+        back.append("与此同时，高原低槽东移、切变线西侧有冷空气渗透，暖湿气流沿副高边缘输入，在%s形成辐合抬升，水汽充沛、层结不稳定" % _names(rain))
+    elif hot:
+        back.append("副热带高压与大陆高压呈打通态势，控场%s，下沉增温、逆温抑制对流，晴热少云延续" % _names(hot))
+        back.append("盆地其余地区处于高压边缘，午后热力抬升，仍存在分散性对流的触发机会")
+    elif rain:
+        back.append("高原低槽东移并加深，低涡/切变线维持在%s一带，北方冷空气与偏南暖湿气流辐合，触发强降雨的水汽与不稳定能量均已到位" % _names(rain))
+        if conv:
+            back.append("层结不稳定，利于触发雷雨大风、短时强降水等强对流")
+    else:
+        back.append("本轮盆地无明显强天气系统控场，以多云与分散性阵雨为主，天气相对平稳")
+    syn_bg = "".join("（%d）%s。" % (i + 1, t) for i, t in enumerate(back)) if back else "（1）本轮天气相对平稳。"
+
+    # ---- ② 实况呈现
+    hot_s = ("<span class='hl'>%s</span>" % obs_hot[0]) if obs_hot else "盆地"
+    syn_now = ("午后%s以%s℃领跑闷热榜单" % (hot_s, obs_hot[1])) if obs_hot else "午后多站气温在28—36℃之间"
+    if obs_cool:
+        cool_nm = obs_cool[0]
+        cool_ctx = "盆北沿山" if cool_nm in ("广元", "绵阳") else "川西高原" if cool_nm == "康定" else "沿山"
+        syn_now += "；受冷空气先导渗透影响，%s（%s）仅%s℃上下，盆地呈'东西偏热、沿山偏凉'的双轨格局" % (
+            cool_ctx, cool_nm, obs_cool[1])
+    syn_now += "。多数站湿度中等偏上，体感较气温偏高1—3℃。"
+
+    # ---- ③ 系统演变（未来3日）
+    peak_today = [p for p in profiles if p["p0"] >= p["p1"] and p["p0"] >= 20]
+    peak_tomorrow = [p for p in profiles if p["p1"] > p["p0"] and p["p1"] >= 20]
+    peak_s = ""
+    if peak_today or peak_tomorrow:
+        if peak_today:
+            peak_s += "今晚到明天白天%s雨势最盛（单日累计可达%dmm量级）" % (
+                _names(peak_today), max(p["p0"] for p in peak_today))
+        if peak_tomorrow:
+            peak_s += ("；明天主雨带东移，%s仍有一定降雨（%dmm）" % (_names(peak_tomorrow), max(p["p1"] for p in peak_tomorrow)))
+        peak_s += "，后天雨带整体减弱、盆地逐步转多云。"
+    else:
+        peak_s = "未来3日盆地降水整体不强，以分散性阵雨为主，后天大部转多云或晴。"
+
+    # ---- ④ 区域差异
+    diff = ("盆西：西部沿山叠加地形增幅，是强降雨首选落区；盆东/川东北：白天晴热加傍晚对流，" +
+            "需防'高温暴雨同现'的强对流；盆中：晴雨交替的过渡带；盆北：冷空气通道顺流而下，先凉多雨；" +
+            "川西高原/川西南：以高原性午后对流与阵雨为主。")
+    if not hot and not rain:
+        diff = "各分区差异不大，均以多云或阵雨为主；高原与山地午后对流略强，盆西沿山夜雨相对明显。"
+
+    # ---- ⑤ 趋势判断
+    future_hot = [p for p in profiles if p["t1"] >= 35]
+    colding = hot and not future_hot
+    if colding:
+        trend = ("<span class='ok'>高温缓解</span>——%s今日最高<span class='hl'>%s℃</span>仍达高温线，但明日冷空气与降雨压制，" +
+                 "盆地最高温将回落至30℃以下，本轮晴热趋于结束。") % (_names(hot), str(max(p["t0"] for p in hot)))
+    elif future_hot:
+        trend = ("高温延续——%s明日最高温仍可能触及35℃高温线，缓解需等待更系统的冷空气或降雨过程。"
+                 % (_names(future_hot)))
+    else:
+        trend = ("天气平稳——未来3日盆地最高温总体在30℃上下区间，无极端高温，也无系统性强降雨，维持'晴雨交替'的节奏。")
+
+    # ---- ⑥ 风险提示
+    hi = [p for p in profiles if p["risk"]["level"] in ("高", "中")]
+    tip = []
+    if rain:
+        tip.append("重点关注<strong>%s</strong>强降雨可能引发的山洪与地质灾害（具滞后性）" % _names(rain))
+    if conv:
+        tip.append("警惕<strong>%s</strong>午后雷暴大风、短时强降水等强对流" % _names(conv))
+    if hot:
+        tip.append("<strong>%s</strong>白天晴热，午后减少长时间户外活动，谨防中暑" % _names(hot))
+    if not tip:
+        tip.append("本轮无明显灾害性天气，正常出行，注意山区午后对流与沿山夜雨")
+
+    # ---- 标题（点题）
+    if hot and rain:
+        title = "此消彼长：%s余热未消，%s强降雨阻高温抬头" % (_names(hot), _names(rain))
+    elif hot:
+        title = "陆高/副高控场：%s晴热延续，午后警惕局地强对流" % _names(hot)
+    elif rain:
+        title = "低涡切变活跃：%s强降雨，须防山洪与地质灾害" % _names(rain)
+    else:
+        title = "天气相对平稳，晴雨交替，关注午后对流"
+
+    blocks = [("形势背景", syn_bg), ("实况呈现", syn_now), ("系统演变", peak_s),
+              ("区域差异", diff), ("趋势判断", trend), ("风险提示", "；".join(tip) + "。")]
+    return title, blocks
+
+
 # ---------- 渲染主函数 ----------
 def render(fetched, ventusky_paths, nmc_charts, narr, site_dir, generated):
     ts = generated.strftime("%Y-%m-%d %H:%M")
@@ -519,6 +660,15 @@ def render(fetched, ventusky_paths, nmc_charts, narr, site_dir, generated):
                     "<div class='grid'>{b}</div>"
                     "<div class='note'>预报图由国家气象中心（中央气象台）公开产品发布，时效以图中标注为准；"
                     "图幅为全国范围，盆地落区请结合上方分区风险判断。</div></div>").format(b=blocks)
+
+    # ③ 形势解读（专家视角，数据驱动自动生成）
+    _etitle, _eblocks = build_expert(fetched)
+    echunks = "".join("<div class='echunk'><b>【%s】</b>%s</div>" % (tag, txt) for tag, txt in _eblocks)
+    expert_html = ("<div class='card'><h2><span class='no'>3</span>形势解读（专家视角）</h2>"
+                   "<div class='sec-sub'>依 weather-analyst 范式由每日官方数据自动生成 · 形势→实况→演变→区域→趋势→提示</div>"
+                   "<div class='expert-title'>%s</div><div class='expert'>%s</div>"
+                   "<div class='note'>大尺度环流表述为基于官方数据的专家解读，仅供参考；灾害性天气以属地气象台发布的预报预警为准。</div></div>") % (
+        _etitle, echunks)
 
     # ① 双城实况
     now_cards = ""
@@ -685,7 +835,7 @@ def render(fetched, ventusky_paths, nmc_charts, narr, site_dir, generated):
             mime = "image/jpeg" if p.lower().endswith((".jpg", ".jpeg")) else "image/png"
             blocks += ("<figure><img src='data:{m};base64,{b}'/><figcaption>{l}</figcaption></figure>").format(
                 m=mime, b=b64, l={"wind": "风场", "rain": "降水落区", "temperature": "气温", "pressure": "海平面气压"}.get(k, k))
-        vent = ("<div class='card'><h2><span class='no'>6</span>多要素实况解析（Ventusky 数值模式）</h2>"
+        vent = ("<div class='card'><h2><span class='no'>8</span>多要素实况解析（Ventusky 数值模式）</h2>"
                 "<div class='sec-sub'>同一时刻四要素 · 叠加地形与城市标注 · 与官方数据交叉印证</div>"
                 "<div class='grid'>{b}</div>"
                 "<div class='note'>实况要素面交叉印证，具体取值与结论以中央气象台及属地气象部门官方预报为准。</div></div>").format(b=blocks)
@@ -713,28 +863,29 @@ def render(fetched, ventusky_paths, nmc_charts, narr, site_dir, generated):
   强对流/高温/强降雨的具体落区以属地气象台预警为准。</p></div></div></div>
 
 {nmc_html}
+{expert_html}
 
-<div class="card"><h2><span class="no">3</span>双城官方实况</h2>
+<div class="card"><h2><span class="no">4</span>双城官方实况</h2>
 <div class="sec-sub">成都 / 重庆 实时观测 · 发布于 {pub}</div><div class="now">{now_cards}</div></div>
 
-<div class="card"><h2><span class="no">4</span>分区天气与三维风险评估</h2>
+<div class="card"><h2><span class="no">5</span>分区天气与三维风险评估</h2>
 <div class="sec-sub">按分区 × 逐日聚合 · 风险合成降雨(0-3)/高温(0-3)/强对流(0-2) 三轴；高/中需重点防范</div>
 {regions_html}
 <div class="note">风险由各分区代表城市官方逐日预报中的最大单日降水、72h最高气温与雷雨对流信号经透明白箱规则综合评定；
   仅作形势研判，灾害性天气请以属地气象台预警为准。</div></div>
 
-<div class="card"><h2><span class="no">5</span>重点天气过程</h2>
+<div class="card"><h2><span class="no">6</span>重点天气过程</h2>
 <div class="sec-sub">由分区风险自动提炼的过程清单</div>
 <ul class="proc">{proc_html}</ul></div>
 
-<div class="card"><h2><span class="no">6</span>分区逐日预报总览（官方）</h2>
+<div class="card"><h2><span class="no">7</span>分区逐日预报总览（官方）</h2>
 <div class="sec-sub">今明两日逐日天气与最高温 · 柱条反映今日相对降水强度</div>
 <table><thead><tr><th>分区</th><th>城市</th><th>今日最高</th><th>今日天气</th><th>明日最高</th><th>明日天气</th></tr></thead>
 <tbody>{rows}</tbody></table></div>
 
 {vent}
 
-<div class="card"><h2><span class="no">8</span>关注与提示</h2>
+<div class="card"><h2><span class="no">9</span>关注与提示</h2>
 <div class="sec-sub">按分区风险生成，红标为首要关注</div>
 <div class="foc">{foc_html}</div>
 {narr_block}</div>
@@ -743,7 +894,8 @@ def render(fetched, ventusky_paths, nmc_charts, narr, site_dir, generated):
 灾害性天气请以属地气象部门发布的预报预警为准。</div>
 </div></body></html>""".format(
         css=CSS, d=dstr, pub=publish, gen=ts, syn=syn, now_cards=now_cards,
-        nmc_html=nmc_html, regions_html=regions_html, rows=rows, proc_html=proc_html, foc_html=foc_html,
+        nmc_html=nmc_html, expert_html=expert_html, regions_html=regions_html,
+        rows=rows, proc_html=proc_html, foc_html=foc_html,
         vent=vent, narr_block=narr_block,
         vent_note=(" / Ventusky" if ventusky_paths else ""))
 
