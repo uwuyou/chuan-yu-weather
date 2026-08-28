@@ -1,0 +1,82 @@
+# 川渝天气自动生成 · 定时 + Pages 发布
+name: Generate Weather
+
+# 触发：每天 22:30 UTC（北京 06:30）+ 手动；仅 src/工作流改动触发 push
+on:
+  schedule:
+    - cron: '30 22 * * *'
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['src/**', '.github/workflows/**', 'requirements.txt']
+
+# 需要写仓库(keep-alive)、写 Pages、identity token(deploy)
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+# 同一时刻只跑一个，避免互相覆盖 keep-alive 提交
+concurrency:
+  group: weather
+  cancel-in-progress: true
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # Playwright/Chromium 仅用于 Ventusky 截图；失败不致命（脚本会回退核心模式）
+      - name: Install playwright (best-effort)
+        continue-on-error: true
+        run: |
+          pip install --quiet playwright
+          python -m playwright install --with-deps chromium
+
+      - name: Build report
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
+          OPENAI_MODEL: ${{ secrets.OPENAI_MODEL }}
+        run: |
+          export PYBIN=python3
+          # 有 LLM key 就开启 --llm
+          if [ -n "$OPENAI_API_KEY" ]; then LLM=--llm; else LLM=; fi
+          python3 src/generate_weather.py --ventusky $LLM --out site
+
+      # 备份一份最新产物到 main，作为仓库保活动作（解决 cron 闲置暂停问题）
+      - name: Keep-alive commit (site/)
+        continue-on-error: true
+        run: |
+          git config user.email "actions@github.com"
+          git config user.name "github-actions"
+          git add site/
+          if git diff --cached --quiet; then
+            echo "无变更，跳过提交"
+          else
+            git commit -m "chore: auto-generate weather report $(date -u +%Y%m%dT%H%M)"
+            git push origin main
+          fi
+
+      - name: Configure Pages
+        id: pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+      - name: Deploy to Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

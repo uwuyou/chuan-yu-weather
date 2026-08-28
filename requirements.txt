@@ -1,0 +1,2 @@
+# Python 依赖（Ventusky 截图用；核心 NMC 抓取使用标准库，无需安装）
+playwright

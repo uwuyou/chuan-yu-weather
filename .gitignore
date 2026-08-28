@@ -1,0 +1,5 @@
+# 生成产物/缓存
+site/
+__pycache__/
+*.pyc
+.env
