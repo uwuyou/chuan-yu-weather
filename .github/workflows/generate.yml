@@ -54,17 +54,18 @@ jobs:
           if [ -n "$OPENAI_API_KEY" ]; then LLM=--llm; else LLM=; fi
           python3 src/generate_weather.py --ventusky $LLM --out site
 
-      # 备份一份最新产物到 main，作为仓库保活动作（解决 cron 闲置暂停问题）
-      - name: Keep-alive commit (site/)
+      # 心跳保活：只提交一个时间戳文件，避免仓库历史膨胀（并规避 cron 60 天闲置暂停）
+      - name: Keep-alive heartbeat
         continue-on-error: true
         run: |
+          echo "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > .heartbeat
           git config user.email "actions@github.com"
           git config user.name "github-actions"
-          git add site/
+          git add .heartbeat
           if git diff --cached --quiet; then
             echo "无变更，跳过提交"
           else
-            git commit -m "chore: auto-generate weather report $(date -u +%Y%m%dT%H%M)"
+            git commit -m "chore: heartbeat $(date -u +%Y%m%dT%H%M)"
             git push origin main
           fi
 

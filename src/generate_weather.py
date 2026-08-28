@@ -99,8 +99,8 @@ def capture_ventusky(out_dir, target="30.50;105.50;6"):
                 try:
                     page.goto(tpl.format(p=target), wait_until="domcontentloaded", timeout=30000)
                     page.wait_for_timeout(5000)  # 等瓦片渲染
-                    path = os.path.join(out_dir, "{k}.png".format(k=key))
-                    page.screenshot(path=path, timeout=30000)
+                    path = os.path.join(out_dir, "{k}.jpg".format(k=key))
+                    page.screenshot(path=path, type="jpeg", quality=78, timeout=30000)
                     paths[key] = path
                 except Exception as ex:
                     print("[ventusky] {k} 失败: {e}".format(k=key, e=ex))
@@ -194,7 +194,9 @@ def render(meta, cities_rows, narr, ventusky_paths, site_dir):
         blocks = ""
         for k, p in ventusky_paths.items():
             with open(p, "rb") as f:
-                src = "data:image/png;base64," + base64.b64encode(f.read()).decode()
+                b64 = base64.b64encode(f.read()).decode()
+            mime = "image/jpeg" if p.lower().endswith((".jpg", ".jpeg")) else "image/png"
+            src = "data:{m};base64,{b}".format(m=mime, b=b64)
             blocks += ("<figure><img src='{src}'/><figcaption>{lbl}</figcaption></figure>".format(
                 src=src, lbl={"wind": "风场", "rain": "降水落区",
                               "temperature": "气温", "pressure": "海平面气压"}.get(k, k)))
