@@ -273,6 +273,7 @@ def fetch_city(name, pinyin):
         })
     return {
         "name": name,
+        "code": code,
         "publish": real.get("publish_time", ""),
         "now_temp": _temp(weat.get("temperature")),
         "now_rain": weat.get("rain"),
@@ -721,12 +722,15 @@ MAP_CARD = """<div class="card"><h2><span class="no">6</span>川渝全站点实�
   ]);
 
   /* 图层1：代表城区今日预报最高温 */
-  var rep=[];
+  var rep=[], REPMAP={};
   DATA.forEach(function(p){
-    rep.push(L.circleMarker([p.lat,p.lng],{radius:radFix(p.tmax),color:'#222',weight:2,fillColor:colorOf(p.tmax),fillOpacity:0.88,riseOnHover:true})
-      .bindPopup('<b>'+p.city+'</b>（'+p.region+'）<br/>今日预报最高 <b style="color:#c23b2e">'+(p.tmax!=null?p.tmax+'℃':'—')+'</b>'+(p.hasFc?'':'（以实况近似）')+'<br/>当前实况 '+(p.now!=null?p.now+'℃':'—')));
+    var mk=L.circleMarker([p.lat,p.lng],{radius:radFix(p.tmax),color:'#222',weight:2,fillColor:colorOf(p.tmax),fillOpacity:0.88,riseOnHover:true});
+    mk.city=p.city; mk.region=p.region; mk._tmax=p.tmax; mk._now=p.now;
+    mk.bindPopup('<b>'+p.city+'</b>（'+p.region+'）<br/>今日预报最高 <b style="color:#c23b2e">'+(p.tmax!=null?p.tmax+'℃':'—')+'</b>'+(p.hasFc?'':'（以实况近似）')+'<br/>当前实况 '+(p.now!=null?p.now+'℃':'—'));
+    rep.push(mk); REPMAP[p.city]=mk;
   });
   var repLayer=L.layerGroup(rep).addTo(map);
+  window.__WEATHER_REP=REPMAP;
 
   /* 图层2：川渝全站点实时实况 */
   var live=[];
@@ -846,6 +850,147 @@ LIVE_JS = r"""<script>
   }
   refresh();
   setInterval(refresh, 120000);
+})();
+</script>"""
+
+
+# ---------- 前端实时预报刷新（随 NMC 官方预报自动追更：今/明预报表·分区今日·双城今日·地图代表层） ----------
+# 纯字符串（不经 .format，花括号为 JS 字面量）；__LIVE_CODES__ 在 render 时替换为 JSON。
+LIVE_FORECAST_JS = r"""<script>
+(function(){
+  /* 与 NMC 官方预报实时对齐：逐城拉取 predict，刷新卡片9分区逐日预报总览表、卡片7分区卡片"今日"、
+     卡片5双城"今日"预报、以及地图"代表城区今日预报最高"层。失败自动保留原值。 */
+  var CODES=__LIVE_CODES__;
+  function rt(v){v=Number(v);return(!isNaN(v)&&Math.abs(v)<=60)?Math.round(v):null;}
+  function precOf(v){v=Number(v);return(!isNaN(v)&&v>=0&&v<=800&&v!==9999)?v:0;}
+  function cleanInfo(s){s=String(s||'').trim();return(s==='9999'||s==='999'||s==='0'||s==='-'||s==='')?'':s;}
+  function dayOf(dd){
+    var d=(dd&&dd.day&&dd.day.weather)||{}, n=(dd&&dd.night&&dd.night.weather)||{};
+    var info=cleanInfo(d.info), ninfo=cleanInfo(n.info);
+    if(ninfo&&ninfo!==info){info=info?info+'转'+ninfo:ninfo;}
+    return{info:info||'-',tmax:rt(d.temperature),tmin:rt(n.temperature),prec:precOf(dd&&dd.precipitation)};
+  }
+  function fmtT(v){return(v==null)?'-':v+'°';}
+  function barW(p){return Math.min(100,Math.max(3,Math.round((p||0)/60*100)));}
+  function colorOf(t){if(t==null)return'#8aa0b5';if(t>=35)return'#c23b2e';if(t>=33)return'#ff7a2f';if(t>=30)return'#f2c23b';if(t>=25)return'#58b3e0';return'#3a79c2';}
+  function radFix(t){if(t==null)return 9;if(t>=35)return 16;if(t>=33)return 14;if(t>=30)return 12;if(t>=27)return 10;return 8;}
+
+  function applyCity(nm,d0,d1){
+    /* 卡片9 分区逐日预报总览表 */
+    var tr=document.querySelector('tr[data-city="'+nm+'"]');
+    if(tr&&tr.cells){
+      if(tr.cells[2])tr.cells[2].textContent=fmtT(d0.tmax);
+      if(tr.cells[4])tr.cells[4].textContent=fmtT(d1.tmax);
+      if(tr.cells[3])tr.cells[3].innerHTML=d0.info+'<span class="wbar"><i style="width:'+barW(d0.prec)+'%"></i></span>';
+      if(tr.cells[5])tr.cells[5].textContent=d1.info;
+    }
+    /* 卡片7 分区卡片·今日 */
+    var crow=document.querySelector('.crow[data-city="'+nm+'"]');
+    if(crow){
+      var td=crow.querySelector('.today'); if(td)td.innerHTML=d0.info+' <b>'+fmtT(d0.tmax)+'</b>/'+fmtT(d0.tmin);
+      var cb=crow.querySelector('.pbar i'); if(cb)cb.style.width=barW(d0.prec)+'%';
+    }
+    /* 卡片5 双城今日预报 */
+    var city=document.querySelector('.city[data-city="'+nm+'"]');
+    if(city){var dt=city.querySelector('.dt'); if(dt)dt.setAttribute('data-today',d0.info);}
+    /* 地图代表城区（今日预报最高） */
+    if(window.__WEATHER_REP&&window.__WEATHER_REP[nm]&&d0.tmax!=null){
+      var mk=window.__WEATHER_REP[nm], nowt=(mk._now!=null?mk._now+'℃':'—');
+      mk.setStyle({fillColor:colorOf(d0.tmax),radius:radFix(d0.tmax)});
+      mk.setPopupContent('<b>'+nm+'</b>（'+mk.region+'）<br/>今日预报最高 <b style="color:#c23b2e">'+d0.tmax+'℃</b><br/>当前实况 '+nowt);
+    }
+  }
+  function refresh(){
+    var cities=Object.keys(CODES), i=0, done=0, news={};
+    (function next(){
+      if(i>=cities.length){if(done>=cities.length){for(var k in news)applyCity(k,news[k].d0,news[k].d1);} return;}
+      var j=i++, nm=cities[j];
+      fetch('https://www.nmc.cn/rest/weather?stationid='+CODES[nm])
+        .then(function(r){return r.json();})
+        .then(function(d){
+          var det=((d&&d.data&&d.data.predict)||{}).detail||[];
+          if(det[0]&&det[0].day)news[nm]={d0:dayOf(det[0]),d1:dayOf(det[1]||det[0])};
+        }).catch(function(){})
+        .then(function(){done++;next();});
+    })();
+  }
+  refresh();
+  setInterval(refresh,120000);
+})();
+</script>"""
+
+
+# ---------- 前端官方预警实时刷新（weather.cma.cn 国家预警信息发布中心，CORS 已开放） ----------
+# 周期重拉川/渝两省现行预警，就地重建卡片4横幅/统计/清单/分区标签；失败保留原内容。
+LIVE_ALARM_JS = r"""<script>
+(function(){
+  var LEVELS=['红色','橙色','黄色','蓝色'];
+  var CATS=["地质灾害气象","道路结冰","低温雨雪","森林草原火险","森林火险","强对流云团","雷雨大风","沙尘暴","台风","暴雨大风","暴雨","暴雪","寒潮","大风","冰雹","雷电","大雾","高温","干旱","霜冻","山洪","强对流","低温","霾"];
+  var RMAP=[["盆西",["成都","雅安","眉山"]],["盆东",["重庆","广安"]],["盆中",["遂宁","南充","资阳"]],["盆北",["广元","绵阳","巴中"]],["川西高原",["甘孜","阿坝","康定","马尔康"]],["川西南",["凉山","西昌","攀枝花"]],["川东北",["达州","巴中"]]];
+  function regions(area,prov){
+    var out=[];
+    for(var i=0;i<RMAP.length;i++){var r=RMAP[i];for(var k=0;k<r[1].length;k++){if(area.indexOf(r[1][k])>=0&&out.indexOf(r[0])<0)out.push(r[0]);}}
+    if(prov==='重庆'&&out.indexOf('盆东')<0)out.push('盆东');
+    return out;
+  }
+  function parse(item,prov){
+    var text=(item.title||'')+'';
+    var level='', cat='其他', area='-';
+    for(var i=0;i<LEVELS.length;i++){if(text.indexOf(LEVELS[i])>=0){level=LEVELS[i];break;}}
+    for(var i=0;i<CATS.length;i++){if(text.indexOf(CATS[i])>=0){cat=CATS[i];break;}}
+    var idx=text.indexOf('气象台发布');
+    var area0=(idx>=0?text.slice(0,idx):text).trim();
+    area=(area0.replace(/^(四川省|重庆市|重庆)/,'').trim()||area0||'-');
+    return{level:level,cat:cat,area:area,prov:prov,regions:regions(text,prov),time:((item.issuetime||'').replace(/\//g,'-'))};
+  }
+  function fetchAlarm(prov,label){
+    return fetch('https://www.nmc.cn/rest/findAlarm?pageNo=1&pageSize=60&signaltype=&signallevel=&province='+encodeURIComponent(prov))
+      .then(function(r){return r.json();})
+      .then(function(d){var L=((d&&d.data&&d.data.page&&d.data.page.list)||[]);return L.map(function(it){return parse(it,label);});})
+      .catch(function(){return null;});
+  }
+  function refresh(){
+    Promise.all([fetchAlarm('四川省','四川'),fetchAlarm('重庆市','重庆')]).then(function(rows){
+      var all=[],have=false;
+      rows.forEach(function(r){if(r){have=true;all=all.concat(r);}});
+      if(!have)return;
+      var seen={},uniq=[];
+      all.forEach(function(a){var k=a.cat+'|'+a.level+'|'+a.area;if(seen[k])return;seen[k]=1;uniq.push(a);});
+      var ord={'红色':0,'橙色':1,'黄色':2,'蓝色':3,'其他':9};
+      uniq.sort(function(a,b){return ord[a.level]-ord[b.level];});
+      render(uniq);
+    }).catch(function(){});
+  }
+  function render(list){
+    var card=document.querySelector('.alarm-banner'); if(!card)card=document.querySelector('.alarm-stats'); if(!card)return;
+    card=card.closest('.card'); var sc=0,cq=0,counts={};
+    list.forEach(function(a){if(a.prov==='四川')sc++;if(a.prov==='重庆')cq++;counts[a.level]=(counts[a.level]||0)+1;});
+    var n=list.length, hi=null;LEVELS.forEach(function(l){if(!hi&&counts[l])hi=l;});
+    var bz={'红色':'严重','橙色':'较重','黄色':'注意','蓝色':'一般'};
+    var bannerEl=card.querySelector('.alarm-banner');
+    if(bannerEl){
+      var crit=list.filter(function(a){return(a.level==='红色'||a.level==='橙色')&&a.regions.length;}), hin;
+      if(crit.length){
+        var rgs={},cats={};crit.forEach(function(a){a.regions.forEach(function(r){rgs[r]=1;});cats[a.cat]=1;});
+        hin='<span class="ab-icon">⚠</span><div><b>本报告分区 '+Object.keys(rgs).sort().join('、')+' 现有多条'+(hi||'')+'预警</b><span>类型：'+Object.keys(cats).sort().join('、')+'｜请以属地气象台最新发布为准，红色/橙色预警区域避免高风险活动。</span></div>';
+      }else{
+        hin='<div><b>当前川渝最高预警级别：'+(hi||'无')+'（'+(hi?bz[hi]:'-')+'）</b><span>生效预警共 '+n+' 条，红橙黄蓝按官方分级，请关注与您所在/前往地区相关条目。</span></div>';
+      }
+      bannerEl.innerHTML=hin;
+    }
+    var statsEl=card.querySelector('.alarm-stats');
+    if(statsEl){var chips='';LEVELS.forEach(function(l){if(counts[l])chips+='<span class="s-chip c-'+l+'">'+l+' '+counts[l]+'</span>';});
+      statsEl.innerHTML='<span class="s-total">四川 '+sc+' 条 · 重庆 '+cq+' 条 · 共 '+n+' 条</span>'+chips;}
+    var listEl=card.querySelector('.alarms');
+    if(listEl){var rows='';
+      list.slice(0,22).forEach(function(a){
+        var tags=a.regions.map(function(r){return'<span class="areg">'+r+'</span>';}).join('');
+        rows+='<div class="alarm-row"><span class="alv lv-'+(a.level||'其他')+'">'+(a.level||'其他')+'</span><span class="acat">'+a.cat+'</span><span class="aarea">'+a.area+'</span><span class="atime">'+(((a.time||'').slice(5))||'-')+'</span>'+tags+'</div>';
+      });
+      listEl.innerHTML=rows;}
+  }
+  refresh();
+  setInterval(refresh,300000);
 })();
 </script>"""
 
@@ -1187,6 +1332,8 @@ def render(fetched, ventusky_paths, nmc_charts, narr, site_dir, generated, alarm
     alarm_html = build_alarm_card(alarms or [], alarm_cnt or {})
     # 川渝全站点实况 · 地图（插入为卡片 6）
     map_html = build_map_card(fetched, stations or [])
+    # 前端实时预报刷新所需的 城市→站点代码 映射（来自实际抓取到的 fetched；无代码的城市自动跳过）
+    live_codes = {nm: c.get("code") for nm, c in fetched.items() if c.get("code")}
 
     # ② 官方预报图（NMC）
     nmc_html = ""
@@ -1290,7 +1437,7 @@ def render(fetched, ventusky_paths, nmc_charts, narr, site_dir, generated, alarm
                 ccls = "background:#e2853a;color:#fff"; cbl = "中"
             else:
                 ccls = "background:#c8d4e0;color:#3b4f62"
-            crows += ("<div class='crow'><div class='cn'>{nm}<span class='cb' style='{cls}'>{bl}</span></div>"
+            crows += ("<div class='crow' data-city='{nm}'><div class='cn'>{nm}<span class='cb' style='{cls}'>{bl}</span></div>"
                       "<div class='today'>{info} <b>{tmax}°</b>/<b>{tmin}°</b></div>"
                       "<div class='pbar'><i style='width:{pb}%'></i></div></div>").format(
                 nm=c["name"], info=(d0.get("info") or "-"),
@@ -1368,9 +1515,9 @@ def render(fetched, ventusky_paths, nmc_charts, narr, site_dir, generated, alarm
             d1 = c["days"][1] if len(c["days"]) > 1 else d0
             p0 = (d0.get("precip") or 0)
             pb = min(100, round((p0 / 60.0) * 100))
-            rows += ("<tr><td>{r}</td><td><b>{nm}</b></td>"
-                     "<td>{t0}</td><td>{w0}<span class='wbar'><i style='width:{pb}%'></i></span></td>"
-                     "<td>{t1}</td><td>{w1}</td></tr>").format(
+            rows += ("<tr data-city='{nm}'><td>{r}</td><td><b>{nm}</b></td>"
+                 "<td>{t0}</td><td>{w0}<span class='wbar'><i style='width:{pb}%'></i></span></td>"
+                 "<td>{t1}</td><td>{w1}</td></tr>").format(
                 r=r["name"], nm=nm, t0=fmt_temp(d0.get("tmax")),
                 w0=(d0.get("info") or "-"), pb=pb,
                 t1=fmt_temp(d1.get("tmax")), w1=(d1.get("info") or "-"))
@@ -1445,15 +1592,20 @@ def render(fetched, ventusky_paths, nmc_charts, narr, site_dir, generated, alarm
 
 <footer>
   <div class="foot">本页由 GitHub Actions 定时自动生成 · 数据来自中央气象台 NMC（含官方预报图）{vent_note} · 未经人工审核，仅供参考<br/>
-  灾害性天气请以属地气象部门发布的预报预警为准。双城实况与预报发布在页面加载时实时向 NMC 刷新。</div>
+  灾害性天气请以属地气象部门发布的预报预警为准。实况/预报与官方预警在页面加载后持续自动向 NMC、国家预警中心实时追更。</div>
  </footer>
  {live_js}
+ {live_forecast_js}
+ {live_alarm_js}
  </body></html>""".format(
         css=CSS, d=dstr, pub=publish, gen=ts, syn=syn, now_cards=now_cards,
         nmc_html=nmc_html, expert_html=expert_html, alarm_html=alarm_html,
         map_html=map_html, regions_html=regions_html,
         rows=rows, proc_html=proc_html, foc_html=foc_html,
-        vent=vent, narr_block=narr_block, live_js=LIVE_JS,
+        vent=vent, narr_block=narr_block,
+        live_js=LIVE_JS,
+        live_forecast_js=LIVE_FORECAST_JS.replace("__LIVE_CODES__", json.dumps(live_codes, ensure_ascii=False)),
+        live_alarm_js=LIVE_ALARM_JS,
         vent_note=(" / Ventusky" if ventusky_paths else ""))
 
     os.makedirs(site_dir, exist_ok=True)
