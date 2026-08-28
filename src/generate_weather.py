@@ -37,6 +37,17 @@ REGIONS = [
 ]
 KNOWN_CODES = {"重庆": "UkfaS"}  # 重庆位于 ACQ 分区，走已知代码
 
+# 代表城市经纬度（WGS84，用于地图标点）
+CITY_COORDS = {
+    "成都": (30.5728, 104.0668), "雅安": (29.9791, 103.0131), "眉山": (30.0489, 103.8317),
+    "重庆": (29.5630, 106.5516), "广安": (30.4560, 106.6332),
+    "遂宁": (30.5321, 105.5717), "南充": (30.8371, 106.1106), "资阳": (30.1289, 104.6359),
+    "广元": (32.4354, 105.8434), "绵阳": (31.4731, 104.6798), "巴中": (31.8661, 106.7437),
+    "康定": (29.9985, 101.9640), "马尔康": (31.9057, 102.2213),
+    "西昌": (27.8945, 102.2585), "攀枝花": (26.5804, 101.7183),
+    "达州": (31.2096, 107.4676),
+}
+
 
 # ---------- 数据抓取 ----------
 def http_get(url, timeout=12):
@@ -458,6 +469,62 @@ def build_alarm_card(alarms, cnt, top=22):
         banner=banner, stats=stats, rows=rows, more=more)
 
 
+# ---------- 今日最高温分布 · 地图（Leaflet + 多底图回退） ----------
+MAP_CARD = """<div class="card"><h2><span class="no">6</span>今日最高温分布 · 地图</h2>
+<div class="sec-sub">川渝代表城市 今日最高温示意（点色/点径按气温分级） · 悬浮查看分区与当前实况</div>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<style>
+#heatmax{height:470px;width:100%;border-radius:12px;overflow:hidden;border:1px solid var(--line);background:#e9edf2}
+.heat-legend{display:flex;flex-wrap:wrap;gap:4px;margin-top:10px;font-size:11.5px;color:#41556a;align-items:center}
+.heat-legend b{margin-right:4px;color:var(--navy)}
+.heat-legend .hl{display:inline-flex;align-items:center;gap:5px;margin:0 8px 4px 0}
+.heat-legend .hl i{width:11px;height:11px;border-radius:50%;display:inline-block;border:1px solid rgba(0,0,0,.12)}
+</style>
+<div id="heatmax"></div>
+<div class="heat-legend"><b>分级（今日最高温，℃）</b>
+<span class="hl"><i style="background:#c23b2e"></i>≥35</span>
+<span class="hl"><i style="background:#ff7a2f"></i>33–34.9</span>
+<span class="hl"><i style="background:#f2c23b"></i>30–32.9</span>
+<span class="hl"><i style="background:#58b3e0"></i>27–29.9</span>
+<span class="hl"><i style="background:#3a79c2"></i>&lt;27</span>
+<span class="hl" style="margin-left:6px;color:#8aa0b5">圆点半径随气温增大</span></div>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+(function(){
+  var DATA=__DATA__;
+  function colorOf(t){if(t==null)return '#8aa0b5';if(t>=35)return '#c23b2e';if(t>=33)return '#ff7a2f';if(t>=30)return '#f2c23b';if(t>=27)return '#58b3e0';return '#3a79c2';}
+  function radOf(t){if(t==null)return 6;if(t>=37)return 15;if(t>=35)return 13;if(t>=33)return 11;if(t>=30)return 9;return 7;}
+  var map=L.map('heatmax',{scrollWheelZoom:false}).setView([30.6,105.6],6);
+  var provs=['https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',
+             'https://a.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png',
+             'https://cartodb-basemaps-a.global.ssl.fastly.net/light_all/{z}/{x}/{y}.png'];
+  var pi=0, base=L.tileLayer(provs[0],{subdomains:'abc',maxZoom:10,attribution:'© OpenStreetMap（多底图回退）'}).addTo(map);
+  base.on('tileerror',function(){if(pi+1<provs.length){pi++;base.setUrl(provs[pi]);}});
+  DATA.forEach(function(p){
+    L.circleMarker([p.lat,p.lng],{radius:radOf(p.tmax),color:'#fff',weight:2,fillColor:colorOf(p.tmax),fillOpacity:0.9})
+      .addTo(map)
+      .bindPopup('<b>'+p.city+'</b>（'+p.region+'）<br/>今日最高 <b style="color:#c23b2e">'+(p.tmax!=null?p.tmax+'℃':'—')+'</b><br/>当前实况 '+(p.now!=null?p.now+'℃':'—'));
+  });
+})();
+</script>
+</div>"""
+
+
+def build_map_card(fetched):
+    pts = []
+    for r in REGIONS:
+        for nm, _py in r["cities"]:
+            c = fetched.get(nm)
+            if not c or nm not in CITY_COORDS:
+                continue
+            d0 = (c["days"] or [{}])[0]
+            pts.append({"city": nm, "lat": CITY_COORDS[nm][0], "lng": CITY_COORDS[nm][1],
+                        "tmax": d0.get("tmax"), "now": c.get("now_temp"), "region": r["name"]})
+    if not pts:
+        return ""
+    return MAP_CARD.replace("__DATA__", json.dumps(pts, ensure_ascii=False))
+
+
 # 前端实时刷新脚本：页面每次打开即向 NMC 拉取成都/重庆实况，更新双城卡片与预报发布时间。
 # 纯字符串（不经 .format），花括号为 JS 字面量；CORS 已开放(nmc.cn)，失败时保留静态兜底值。
 LIVE_JS = r"""<script>
@@ -838,6 +905,8 @@ def render(fetched, ventusky_paths, nmc_charts, narr, site_dir, generated, alarm
 
     # 官方预警卡片（插入为卡片 4）
     alarm_html = build_alarm_card(alarms or [], alarm_cnt or {})
+    # 今日最高温分布 · 地图（插入为卡片 6）
+    map_html = build_map_card(fetched)
 
     # ② 官方预报图（NMC）
     nmc_html = ""
@@ -1036,7 +1105,7 @@ def render(fetched, ventusky_paths, nmc_charts, narr, site_dir, generated, alarm
             mime = "image/jpeg" if p.lower().endswith((".jpg", ".jpeg")) else "image/png"
             blocks += ("<figure><img src='data:{m};base64,{b}'/><figcaption>{l}</figcaption></figure>").format(
                 m=mime, b=b64, l={"wind": "风场", "rain": "降水落区", "temperature": "气温", "pressure": "海平面气压"}.get(k, k))
-        vent = ("<div class='card'><h2><span class='no'>9</span>多要素实况解析（Ventusky 数值模式）</h2>"
+        vent = ("<div class='card'><h2><span class='no'>10</span>多要素实况解析（Ventusky 数值模式）</h2>"
                 "<div class='sec-sub'>同一时刻四要素 · 叠加地形与城市标注 · 与官方数据交叉印证</div>"
                 "<div class='grid'>{b}</div>"
                 "<div class='note'>实况要素面交叉印证，具体取值与结论以中央气象台及属地气象部门官方预报为准。</div></div>").format(b=blocks)
@@ -1068,26 +1137,28 @@ def render(fetched, ventusky_paths, nmc_charts, narr, site_dir, generated, alarm
 {alarm_html}
 
 <div class="card"><h2><span class="no">5</span>双城官方实况</h2>
-<div class="sec-sub">成都 / 重庆 实时观测 · 发布于 {pub}</div><div class="now">{now_cards}</div></div>
+<div class="sec-sub">成都 / 重庆 实时观测 · 实时刷新于 {pub}</div><div class="now">{now_cards}</div></div>
 
-<div class="card"><h2><span class="no">6</span>分区天气与三维风险评估</h2>
+{map_html}
+
+<div class="card"><h2><span class="no">7</span>分区天气与三维风险评估</h2>
 <div class="sec-sub">按分区 × 逐日聚合 · 风险合成降雨(0-3)/高温(0-3)/强对流(0-2) 三轴；高/中需重点防范</div>
 {regions_html}
 <div class="note">风险由各分区代表城市官方逐日预报中的最大单日降水、72h最高气温与雷雨对流信号经透明白箱规则综合评定；
   仅作形势研判，灾害性天气请以属地气象台预警为准。</div></div>
 
-<div class="card"><h2><span class="no">7</span>重点天气过程</h2>
+<div class="card"><h2><span class="no">8</span>重点天气过程</h2>
 <div class="sec-sub">由分区风险自动提炼的过程清单</div>
 <ul class="proc">{proc_html}</ul></div>
 
-<div class="card"><h2><span class="no">8</span>分区逐日预报总览（官方）</h2>
+<div class="card"><h2><span class="no">9</span>分区逐日预报总览（官方）</h2>
 <div class="sec-sub">今明两日逐日天气与最高温 · 柱条反映今日相对降水强度</div>
 <table><thead><tr><th>分区</th><th>城市</th><th>今日最高</th><th>今日天气</th><th>明日最高</th><th>明日天气</th></tr></thead>
 <tbody>{rows}</tbody></table></div>
 
 {vent}
 
-<div class="card"><h2><span class="no">10</span>关注与提示</h2>
+<div class="card"><h2><span class="no">11</span>关注与提示</h2>
 <div class="sec-sub">按分区风险生成，红标为首要关注</div>
 <div class="foc">{foc_html}</div>
 {narr_block}</div>
@@ -1100,7 +1171,7 @@ def render(fetched, ventusky_paths, nmc_charts, narr, site_dir, generated, alarm
  </body></html>""".format(
         css=CSS, d=dstr, pub=publish, gen=ts, syn=syn, now_cards=now_cards,
         nmc_html=nmc_html, expert_html=expert_html, alarm_html=alarm_html,
-        regions_html=regions_html,
+        map_html=map_html, regions_html=regions_html,
         rows=rows, proc_html=proc_html, foc_html=foc_html,
         vent=vent, narr_block=narr_block, live_js=LIVE_JS,
         vent_note=(" / Ventusky" if ventusky_paths else ""))
