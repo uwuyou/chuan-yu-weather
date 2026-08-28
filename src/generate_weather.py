@@ -18,8 +18,9 @@
     python3 src/generate_weather.py --llm           # 开启 LLM 润色（需 OPENAI_API_KEY）
     python3 src/generate_weather.py --out <dir>     # 输出目录，默认 ./site
 """
-import argparse, base64, json, os, re, sys, urllib.request
+import argparse, base64, json, os, re, sys, urllib.request, urllib.parse, time
 from datetime import datetime
+import math
 
 UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 NMC_WEATHER = "http://www.nmc.cn/rest/weather?stationid={code}"
@@ -47,6 +48,183 @@ CITY_COORDS = {
     "西昌": (27.8945, 102.2585), "攀枝花": (26.5804, 101.7183),
     "达州": (31.2096, 107.4676),
 }
+
+
+# ---- WGS84 → GCJ-02（高德坐标系）----
+def _out_china(lat, lng):
+    return not (72.004 <= lng <= 137.8347 and 0.8293 <= lat <= 55.8271)
+
+
+def wgs84_to_gcj02(lat, lng):
+    """标准算法（参考点 105°E/35°N）将 WGS84 转为高德 GCJ-02（境外坐标原样返回）。"""
+    if _out_china(lat, lng):
+        return float(lat), float(lng)
+    a = 6378245.0
+    ee = 0.00669342162296594323
+    lat, lng = float(lat), float(lng)
+    x, y = lng - 105.0, lat - 35.0
+
+    def _tl(x, y):
+        ret = -100.0 + 2.0 * x + 3.0 * y + 0.2 * y * y + 0.1 * x * y + 0.2 * math.sqrt(abs(x))
+        ret += (20.0 * math.sin(6.0 * x * math.pi) + 20.0 * math.sin(2.0 * x * math.pi)) * 2.0 / 3.0
+        ret += (20.0 * math.sin(y * math.pi) + 40.0 * math.sin(y / 3.0 * math.pi)) * 2.0 / 3.0
+        ret += (160.0 * math.sin(y / 12.0 * math.pi) + 320.0 * math.sin(y / 30.0 * math.pi)) * 2.0 / 3.0
+        return ret
+
+    def _lg(x, y):
+        ret = 300.0 + x + 2.0 * y + 0.1 * x * x + 0.1 * x * y + 0.1 * math.sqrt(abs(x))
+        ret += (20.0 * math.sin(6.0 * x * math.pi) + 20.0 * math.sin(2.0 * x * math.pi)) * 2.0 / 3.0
+        ret += (20.0 * math.sin(x * math.pi) + 40.0 * math.sin(x / 3.0 * math.pi)) * 2.0 / 3.0
+        ret += (150.0 * math.sin(x / 12.0 * math.pi) + 300.0 * math.sin(x / 30.0 * math.pi)) * 2.0 / 3.0
+        return ret
+
+    dlat = _tl(x, y)
+    dlng = _lg(x, y)
+    radlat = lat / 180.0 * math.pi
+    magic = math.sin(radlat)
+    magic = 1 - ee * magic * magic
+    sqrtmagic = math.sqrt(magic)
+    dlat = (dlat * 180.0) / ((a * (1 - ee)) / (magic * sqrtmagic) * math.pi)
+    dlng = (dlng * 180.0) / (a / sqrtmagic * math.cos(radlat) * math.pi)
+    return lat + dlat, lng + dlng
+
+
+# ---------- 川渝全站点数据集（缓存为 JSON，运行期仅按需解析坐标） ----------
+PROVINCE_URL = "https://www.nmc.cn/rest/province/{code}"
+DATAV_BOUND = "https://geo.datav.aliyun.com/areas_v3/bound/{adcode}_full.json"
+DATAV_PROV = ["510000", "500000"]  # 四川、重庆（DataV 区县坐标已为 GCJ-02，高德直用）
+COUNTY_PATCH = {  # DataV 缺失 centroid 的区县，按其行政边界中心近似
+    "蓬溪县": (30.6526, 105.7168),
+    "叙州区": (28.7860, 104.3897),
+}
+_COUNTY_TAIL = re.compile(
+    r"(土家族苗族自治县|苗族土家族自治县|彝族羌族自治县|藏羌族自治县|"
+    r"彝族自治县|羌族自治县|藏族自治县|苗族侗族自治县|自治州|自治县|县|区|市)$")
+_COUNTY_ALIAS = {
+    "重庆": "渝中区", "凉山": "凉山彝族自治州", "两江新区": "渝北区",
+    "万盛": "綦江区", "会理城区": "会理市", "九龙": "九龙县",
+}
+
+
+def _county_core(s):
+    t = s or ""
+    while True:
+        m = _COUNTY_TAIL.search(t)
+        if not m:
+            break
+        t = t[:m.start()]
+    return t
+
+
+def _geo_county(name, cc):
+    if not name:
+        return None
+    if name in cc:
+        return cc[name]["lat"], cc[name]["lng"]
+    alias = _COUNTY_ALIAS.get(name)
+    if alias and alias in cc:
+        return cc[alias]["lat"], cc[alias]["lng"]
+    core = _county_core(name)
+    for k in cc:
+        if k == name or _county_core(k) == core:
+            return cc[k]["lat"], cc[k]["lng"]
+    pre = [k for k in cc if _county_core(k).startswith(core) and _county_core(k) != core]
+    if pre:
+        pre.sort(key=lambda k: (len(_county_core(k)), len(k)))
+        return cc[pre[0]]["lat"], cc[pre[0]]["lng"]
+    con = [k for k in cc if core and core.startswith(_county_core(k))]
+    if con:
+        con.sort(key=lambda k: -len(_county_core(k)))
+        return cc[con[0]]["lat"], cc[con[0]]["lng"]
+    return None
+
+
+def _datav_get_json(url):
+    return json.loads(http_get(url, timeout=20).decode("utf-8", "ignore"))
+
+
+def build_county_coords(site_dir):
+    """构建或复用川渝区县坐标表（阿里云 DataV / GCJ-02），写入 site/county_coords.json。"""
+    path = os.path.join(site_dir, "county_coords.json")
+    try:
+        if os.path.exists(path):
+            cc = json.load(open(path, encoding="utf-8"))
+            if cc:
+                return cc
+    except Exception:
+        pass
+    cc = {}
+
+    def add(feats):
+        for f in feats:
+            p = f.get("properties") or {}
+            if p.get("name") and p.get("centroid"):
+                cc.setdefault(p["name"], {"adcode": p.get("adcode"),
+                                          "lng": p["centroid"][0], "lat": p["centroid"][1]})
+
+    pref = []
+    for adcode in DATAV_PROV:
+        j = _datav_get_json(DATAV_BOUND.format(adcode=adcode))
+        add(j["features"])
+        for f in j["features"]:
+            ad = (f.get("properties") or {}).get("adcode")
+            if adcode == "510000" and ad and str(ad)[-2:] == "00" and str(ad) != "510000":
+                pref.append(ad)
+    for ad in pref:
+        try:
+            add(_datav_get_json(DATAV_BOUND.format(adcode=ad))["features"])
+            time.sleep(0.15)
+        except Exception:
+            pass
+    for nm, (lat, lng) in COUNTY_PATCH.items():
+        cc.setdefault(nm, {"lat": lat, "lng": lng, "patch": True})
+    os.makedirs(site_dir, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(cc, f, ensure_ascii=False, indent=1)
+    return cc
+
+
+def build_stations(site_dir):
+    """拉取川渝全量站点（NMC：四川 ASC + 重庆 ACQ）并配坐标（DataV GCJ-02），
+    结果缓存到 site/stations.json。坐标仅在出现新站点时解析，日常运行只复用缓存并拉取对应实况。"""
+    path = os.path.join(site_dir, "stations.json")
+    cache = {}
+    try:
+        if os.path.exists(path):
+            for s in json.load(open(path, encoding="utf-8")):
+                if s.get("code") and s.get("lat") is not None:
+                    cache[s["code"]] = s
+    except Exception:
+        pass
+    cc = build_county_coords(site_dir)
+    raw = []
+    for code in ("ASC", "ACQ"):
+        try:
+            raw += _datav_get_json(PROVINCE_URL.format(code=code))
+        except Exception as e:
+            print("[stations] {c} 站点列表失败: {e}".format(c=code, e=e))
+    out, resolved = [], 0
+    seen = set()
+    for st in raw:
+        code, city = st.get("code"), st.get("city")
+        if not code or code in seen:
+            continue
+        seen.add(code)
+        rec = {"code": code, "city": city or "", "province": st.get("province", ""),
+               "lat": None, "lng": None}
+        old = cache.get(code)
+        g = (old["lat"], old["lng"]) if (old and old.get("lat") is not None) else _geo_county(city, cc)
+        if g and g[0] is not None:
+            rec["lat"], rec["lng"] = g[0], g[1]
+            resolved += 1
+        else:
+            print("[stations] 无坐标: {c}/{n}".format(c=code, n=city))
+        out.append(rec)
+    os.makedirs(site_dir, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(out, f, ensure_ascii=False, indent=1)
+    print("[stations] 共 {n} 站点 · 有坐标 {r}".format(n=len(out), r=resolved))
+    return out
 
 
 # ---------- 数据抓取 ----------
@@ -499,48 +677,107 @@ def build_alarm_card(alarms, cnt, top=22):
         banner=banner, stats=stats, rows=rows, more=more)
 
 
-# ---------- 今日最高温分布 · 地图（Leaflet + 多底图回退） ----------
-MAP_CARD = """<div class="card"><h2><span class="no">6</span>今日最高温分布 · 地图</h2>
-<div class="sec-sub">川渝代表城市 当日最高温示意（预报最高缺测时以当前实况近似） · 悬浮查分区与实况</div>
-<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+# ---------- 川渝全站点实况分布 · 地图（高德直连 + 全站点实时） ----------
+MAP_CARD = """<div class="card"><h2><span class="no">6</span>川渝全站点实况分布 · 地图</h2>
+<div class="sec-sub">叠加川渝全量气象站点（四川 __SC_S__ + 重庆 __SC_C__ 个）· 高德底图直连（无需代理）· 圆点按各站点实时实况着色</div>
+<link rel="stylesheet" href="https://cdn.staticfile.org/leaflet/1.9.4/leaflet.min.css"/>
 <style>
-#heatmax{height:470px;width:100%;border-radius:12px;overflow:hidden;border:1px solid var(--line);background:#e9edf2}
+#heatmax{height:520px;width:100%;border-radius:12px;overflow:hidden;border:1px solid var(--line);background:#e9edf2}
 .heat-legend{display:flex;flex-wrap:wrap;gap:4px;margin-top:10px;font-size:11.5px;color:#41556a;align-items:center}
 .heat-legend b{margin-right:4px;color:var(--navy)}
 .heat-legend .hl{display:inline-flex;align-items:center;gap:5px;margin:0 8px 4px 0}
 .heat-legend .hl i{width:11px;height:11px;border-radius:50%;display:inline-block;border:1px solid rgba(0,0,0,.12)}
+.layer-note{font-size:11.5px;color:#7b8ca0;margin-top:6px}
 </style>
 <div id="heatmax"></div>
-<div class="heat-legend"><b>分级（今日最高温，℃）</b>
+<div class="heat-legend"><b>实况气温分级（℃）</b>
 <span class="hl"><i style="background:#c23b2e"></i>≥35</span>
 <span class="hl"><i style="background:#ff7a2f"></i>33–34.9</span>
 <span class="hl"><i style="background:#f2c23b"></i>30–32.9</span>
-<span class="hl"><i style="background:#58b3e0"></i>27–29.9</span>
-<span class="hl"><i style="background:#3a79c2"></i>&lt;27</span>
-<span class="hl" style="margin-left:6px;color:#8aa0b5">圆点半径随气温增大</span></div>
-<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<span class="hl"><i style="background:#58b3e0"></i>25–29.9</span>
+<span class="hl"><i style="background:#3a79c2"></i>&lt;25</span>
+<span class="hl"><i style="background:#8aa0b5"></i>缺测</span></div>
+<div class="layer-note">底图：高德（无需代理）· 小圆点=川渝各站点实时实况（逐点拉取 NMC 实况着色，页面加载与每 10 分钟自动刷新）· 大圆=七分区代表城区今日预报最高温。</div>
+<script src="https://cdn.staticfile.org/leaflet/1.9.4/leaflet.min.js"></script>
 <script>
 (function(){
+  var STATIONS=__STATIONS__;
   var DATA=__DATA__;
-  function colorOf(t){if(t==null)return '#8aa0b5';if(t>=35)return '#c23b2e';if(t>=33)return '#ff7a2f';if(t>=30)return '#f2c23b';if(t>=27)return '#58b3e0';return '#3a79c2';}
-  function radOf(t){if(t==null)return 6;if(t>=37)return 15;if(t>=35)return 13;if(t>=33)return 11;if(t>=30)return 9;return 7;}
+  function colorOf(t){if(t==null)return '#8aa0b5';if(t>=35)return '#c23b2e';if(t>=33)return '#ff7a2f';if(t>=30)return '#f2c23b';if(t>=25)return '#58b3e0';return '#3a79c2';}
+  function radOf(t){if(t==null)return 5;if(t>=35)return 11;if(t>=33)return 10;if(t>=30)return 9;return 7;}
+  function radFix(t){if(t==null)return 9;if(t>=35)return 16;if(t>=33)return 14;if(t>=30)return 12;if(t>=27)return 10;return 8;}
+
   var map=L.map('heatmax',{scrollWheelZoom:false}).setView([30.6,105.6],6);
-  var provs=['https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',
-             'https://a.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png',
-             'https://cartodb-basemaps-a.global.ssl.fastly.net/light_all/{z}/{x}/{y}.png'];
-  var pi=0, base=L.tileLayer(provs[0],{subdomains:'abc',maxZoom:10,attribution:'© OpenStreetMap（多底图回退）'}).addTo(map);
-  base.on('tileerror',function(){if(pi+1<provs.length){pi++;base.setUrl(provs[pi]);}});
+
+  /* 高德底图（国内直连，免代理） */
+  var gdRoad='https://webrd0{s}.is.autonavi.com/appmaptile?lang=zh_cn&size=1&scale=1&style=8&x={x}&y={y}&z={z}';
+  var gdSat='https://webst0{s}.is.autonavi.com/appmaptile?lang=zh_cn&size=1&scale=1&style=6&x={x}&y={y}&z={z}';
+  var gdSatL='https://webst0{s}.is.autonavi.com/appmaptile?lang=zh_cn&size=1&scale=1&style=8&x={x}&y={y}&z={z}';
+  var road=L.tileLayer(gdRoad,{subdomains:'1234',maxZoom:18,attribution:'© 高德地图（直连）'}).addTo(map);
+  var sat=L.layerGroup([
+    L.tileLayer(gdSat,{subdomains:'1234',maxZoom:18,attribution:'© 高德'}),
+    L.tileLayer(gdSatL,{subdomains:'1234',maxZoom:18,transparent:true,attribution:'© 高德'})
+  ]);
+
+  /* 图层1：代表城区今日预报最高温 */
+  var rep=[];
   DATA.forEach(function(p){
-    L.circleMarker([p.lat,p.lng],{radius:radOf(p.tmax),color:'#fff',weight:2,fillColor:colorOf(p.tmax),fillOpacity:0.9})
-      .addTo(map)
-      .bindPopup('<b>'+p.city+'</b>（'+p.region+'）<br/>当日最高 <b style="color:#c23b2e">'+(p.tmax!=null?p.tmax+'℃':'—')+'</b>'+(p.hasFc?'':'（以当前实况近似）')+'<br/>当前实况 '+(p.now!=null?p.now+'℃':'—'));
+    rep.push(L.circleMarker([p.lat,p.lng],{radius:radFix(p.tmax),color:'#222',weight:2,fillColor:colorOf(p.tmax),fillOpacity:0.88,riseOnHover:true})
+      .bindPopup('<b>'+p.city+'</b>（'+p.region+'）<br/>今日预报最高 <b style="color:#c23b2e">'+(p.tmax!=null?p.tmax+'℃':'—')+'</b>'+(p.hasFc?'':'（以实况近似）')+'<br/>当前实况 '+(p.now!=null?p.now+'℃':'—')));
   });
+  var repLayer=L.layerGroup(rep).addTo(map);
+
+  /* 图层2：川渝全站点实时实况 */
+  var live=[];
+  STATIONS.forEach(function(s){
+    live.push(L.circleMarker([s.lat,s.lng],{radius:5,color:'#fff',weight:1,fillColor:'#8aa0b5',fillOpacity:0.9,riseOnHover:true})
+      .bindPopup('<b>'+s.city+'</b>（'+s.province+'）<br/>实况——'));
+  });
+  var liveLayer=L.layerGroup(live).addTo(map);
+
+  L.control.layers({'高德路网':road,'高德卫星':sat},
+    {'代表城区(今日预报最高)':repLayer,'川渝全站点(实时实况)':liveLayer}, {collapsed:false}).addTo(map);
+
+  /* 实时实况：NMC 逐站拉取，并发受控，逐个着色 */
+  function pad(n){return (n<10?'0':'')+n;}
+  function refresh(){
+    var qi=0, tasks=STATIONS.slice();
+    function pump(){
+      while(qi<tasks.length){
+        var i=qi; qi++;
+        (function(i){
+          var s=tasks[i], mk=live[i];
+          fetch('https://www.nmc.cn/rest/weather?stationid='+s.code,{headers:{'X-Requested-With':'fetch'}})
+            .then(function(r){return r.json();})
+            .then(function(d){
+              var real=(d&&d.data&&d.data.real)||{}, wea=real.weather||{};
+              var T=wea.temperature;
+              if(mk && T!=null && !isNaN(T) && Math.abs(T)<=60){
+                mk.setStyle({fillColor:colorOf(T),radius:radOf(T)});
+                var pt=(real.publish_time||'').slice(11,16);
+                mk.setPopupContent('<b>'+s.city+'</b>（'+s.province+'）<br/>实况 <b style="color:#c23b2e">'+Math.round(T)+'℃</b>'+(wea.info?' · '+wea.info:'')+'<br/>发布 '+(pt||'—'));
+              }else if(mk){
+                mk.setPopupContent('<b>'+s.city+'</b>（'+s.province+'）<br/>实况暂缺（数据缺测）');
+              }
+            }).catch(function(){})
+            .then(function(){ pump(); });
+        })(i);
+        return;
+      }
+    }
+    for(var k=0;k<8;k++){
+      if(qi>=tasks.length) break;
+      pump();
+    }
+  }
+  refresh();
+  setInterval(refresh, 600000);
 })();
 </script>
 </div>"""
 
 
-def build_map_card(fetched):
+def build_map_card(fetched, stations):
     pts = []
     for r in REGIONS:
         for nm, _py in r["cities"]:
@@ -548,15 +785,23 @@ def build_map_card(fetched):
             if not c or nm not in CITY_COORDS:
                 continue
             d0 = (c["days"] or [{}])[0]
-            fc_max = d0.get("tmax")          # 今日预报最高（可能缺测=9999已清为None）
-            now = c.get("now_temp")          # 当前实况
-            # 截止目前的当日最高：预报最高有效则用之，否则以当前实况近似
+            fc_max = d0.get("tmax")
+            now = c.get("now_temp")
             val = fc_max if fc_max is not None else now
-            pts.append({"city": nm, "lat": CITY_COORDS[nm][0], "lng": CITY_COORDS[nm][1],
+            glat, glng = wgs84_to_gcj02(*CITY_COORDS[nm])
+            pts.append({"city": nm, "lat": glat, "lng": glng,
                         "tmax": val, "now": now, "region": r["name"], "hasFc": fc_max is not None})
-    if not pts:
+    sts = [{"code": s["code"], "city": s["city"], "province": s.get("province", ""),
+            "lat": s["lat"], "lng": s["lng"]}
+           for s in stations if s.get("lat") is not None]
+    if not pts or not sts:
         return ""
-    return MAP_CARD.replace("__DATA__", json.dumps(pts, ensure_ascii=False))
+    s_cnt = sum(1 for s in sts if "四川" in s["province"])
+    c_cnt = sum(1 for s in sts if "重庆" in s["province"])
+    return (MAP_CARD
+            .replace("__STATIONS__", json.dumps(sts, ensure_ascii=False))
+            .replace("__DATA__", json.dumps(pts, ensure_ascii=False))
+            .replace("__SC_S__", str(s_cnt)).replace("__SC_C__", str(c_cnt)))
 
 
 # 前端实时刷新脚本：页面每次打开即向 NMC 拉取成都/重庆实况，更新双城卡片与预报发布时间。
@@ -933,15 +1178,15 @@ def build_expert(fetched):
 
 
 # ---------- 渲染主函数 ----------
-def render(fetched, ventusky_paths, nmc_charts, narr, site_dir, generated, alarms=None, alarm_cnt=None):
+def render(fetched, ventusky_paths, nmc_charts, narr, site_dir, generated, alarms=None, alarm_cnt=None, stations=None):
     ts = generated.strftime("%Y-%m-%d %H:%M")
     dstr = generated.strftime("%m月%d日")
     publish = next((c["publish"] for c in fetched.values() if c.get("publish")), "-")
 
     # 官方预警卡片（插入为卡片 4）
     alarm_html = build_alarm_card(alarms or [], alarm_cnt or {})
-    # 今日最高温分布 · 地图（插入为卡片 6）
-    map_html = build_map_card(fetched)
+    # 川渝全站点实况 · 地图（插入为卡片 6）
+    map_html = build_map_card(fetched, stations or [])
 
     # ② 官方预报图（NMC）
     nmc_html = ""
@@ -1202,7 +1447,7 @@ def render(fetched, ventusky_paths, nmc_charts, narr, site_dir, generated, alarm
   <div class="foot">本页由 GitHub Actions 定时自动生成 · 数据来自中央气象台 NMC（含官方预报图）{vent_note} · 未经人工审核，仅供参考<br/>
   灾害性天气请以属地气象部门发布的预报预警为准。双城实况与预报发布在页面加载时实时向 NMC 刷新。</div>
  </footer>
- <script>{live_js}</script>
+ {live_js}
  </body></html>""".format(
         css=CSS, d=dstr, pub=publish, gen=ts, syn=syn, now_cards=now_cards,
         nmc_html=nmc_html, expert_html=expert_html, alarm_html=alarm_html,
@@ -1251,11 +1496,13 @@ def main():
     if alarms:
         print("[alarm] 已取官方预警 {n} 条 (去重后)".format(n=len(alarms)))
 
+    stations = build_stations(args.out)
+
     narr = llm_summary(fetched) if args.llm else None
     if not narr:
         narr = "（未启用 LLM 润色，采用上方规则化形势概览与分区风险，数据取官方实时。）"
 
-    render(fetched, vent, nmc_charts, narr, args.out, datetime.now(), alarms, alarm_cnt)
+    render(fetched, vent, nmc_charts, narr, args.out, datetime.now(), alarms, alarm_cnt, stations)
 
 
 if __name__ == "__main__":
