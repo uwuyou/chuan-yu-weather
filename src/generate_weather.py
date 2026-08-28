@@ -794,7 +794,69 @@ MAP_CARD = """<div class="card"><h2><span class="no">6</span>川渝全站点实�
   setInterval(refresh, 600000);
 })();
 </script>
-</div>"""
+<style>
+.share-zone{display:flex;justify-content:flex-end;margin-top:8px}
+.share-btn{border:1px solid #c7d5e2;background:#fff;color:#12395b;font-size:12.5px;font-weight:600;border-radius:20px;
+  padding:6px 14px;cursor:pointer;transition:.15s;box-shadow:0 1px 3px rgba(18,45,80,.08)}
+.share-btn:hover{background:#ecf3fb;border-color:#9db9d4}
+#shareOverlay{position:fixed;inset:0;background:rgba(15,28,46,.55);z-index:99999;display:none;
+  align-items:center;justify-content:center;padding:20px}
+.share-box{background:#fff;border-radius:14px;box-shadow:0 18px 60px rgba(0,0,0,.35);max-width:92vw;max-height:92vh;
+  display:flex;flex-direction:column;overflow:hidden}
+.share-head{display:flex;align-items:center;justify-content:space-between;padding:11px 16px;border-bottom:1px solid #e8eef4}
+.share-head b{color:#12395b;font-size:15px}
+.share-head button{background:none;border:none;font-size:22px;line-height:1;color:#7b8ca0;cursor:pointer;padding:0 4px}
+.share-body{flex:1;overflow:auto;display:flex;background:#eef2f6}
+.share-body img{display:block;max-width:100%;height:auto;margin:auto}
+.share-foot{display:flex;gap:10px;justify-content:center;padding:12px 16px;border-top:1px solid #e8eef4}
+.share-foot button{border:none;border-radius:20px;padding:8px 22px;font-size:14px;font-weight:700;cursor:pointer}
+.share-foot .dl{background:#12395b;color:#fff}
+.share-foot .cancel{background:#eef2f6;color:#41556a}
+</style>
+<div class="share-zone"><button class="share-btn" onclick="shareMapCard6()">📷 分享地图（带实况 · 图片）</button></div>
+<div id="shareOverlay"><div class="share-box">
+  <div class="share-head"><b>川渝全站点实况分布 · 分享图片</b><button onclick="closeShare()">✕</button></div>
+  <div class="share-body"><img id="shareImg" alt="分享地图"/></div>
+  <div class="share-foot"><button class="dl" onclick="downloadShare()">⬇ 下载 PNG</button><button class="cancel" onclick="closeShare()">关闭</button></div>
+</div></div>
+<script>
+(function(){
+  var o=document.getElementById('shareOverlay'); if(o&&o.parentNode&&o.parentNode!==document.body) document.body.appendChild(o);
+  window.__shareCanvas=null;
+  function loadH2c(cb){ if(window.html2canvas) return cb(); var s=document.createElement('script');
+    s.src='https://cdn.staticfile.org/html2canvas/1.4.1/html2canvas.min.js';
+    s.onload=cb; s.onerror=cb; document.head.appendChild(s); }
+  function drawTitle(x,W,y,txt){ x.fillStyle='#12395b'; x.font='bold 24px "PingFang SC","Microsoft YaHei",sans-serif'; x.textAlign='center'; x.fillText(txt,W/2,y); }
+  window.shareMapCard6=function(){
+    loadH2c(function(){
+      var mapEl=document.getElementById('heatmax'), leg=document.querySelector('.heat-legend');
+      if(!mapEl||!window.html2canvas||!leg) return;
+      html2canvas(mapEl,{useCORS:true,scale:2,backgroundColor:'#e9edf2',
+        onclone:function(doc){ var c=doc.querySelector('.leaflet-control-container'); if(c)c.style.display='none';
+          var hl=doc.querySelector('.leaflet-attribution-flag'); if(hl)hl.remove(); }
+      }).then(function(c1){
+        html2canvas(leg,{useCORS:true,scale:2,backgroundColor:null}).then(function(c2){
+          var pad=18,gap=16,tbar=44,W=Math.max(c1.width,c2.width)+pad*2,H=c1.height+c2.height+gap+pad*2+tbar;
+          var cv=document.createElement('canvas'); cv.width=W; cv.height=H;
+          var x=cv.getContext('2d');
+          x.fillStyle='#ffffff'; x.fillRect(0,0,W,H);
+          drawTitle(x,W,pad+26,'川渝全站点实况分布 · 实时地图');
+          x.drawImage(c1,Math.round((W-c1.width)/2),pad+tbar);
+          x.drawImage(c2,Math.round((W-c2.width)/2),pad+tbar+c1.height+gap);
+          window.__shareCanvas=cv;
+          var img=document.getElementById('shareImg'); if(img)img.src=cv.toDataURL('image/png');
+          var ov=document.getElementById('shareOverlay'); if(ov)ov.style.display='flex';
+        });
+      });
+    });
+  };
+  window.downloadShare=function(){ var cv=window.__shareCanvas; if(!cv)return;
+    var a=document.createElement('a'); a.href=cv.toDataURL('image/png'); a.download='川渝实况地图.png'; a.click(); };
+  window.closeShare=function(){ var ov=document.getElementById('shareOverlay'); if(ov)ov.style.display='none'; };
+})();
+</script>
+</div>
+"""
 
 
 def fetch_station_live(sts):
