@@ -486,6 +486,40 @@ def llm_summary(data):
         return None
 
 
+def _visual_review_charts(b64_charts):
+    """用视觉LLM读取中央气象台官方【实时】实况天气图，综合识别天气系统；无key或失败返回None。
+    b64_charts: [(图名, base64字符串)]（base64不含data:前缀）"""
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key or not b64_charts:
+        return None
+    base = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
+    sys_p = ("你是专业天气形势分析员，遵循川渝气象分析范式。下面给出中央气象台官方【实时】实况分析天气图"
+             "（图上已标注等值线、槽线、切变线、锋线、高/低压中心等官方分析）。请综合这些实时天气图，"
+             "用简体中文输出一段【实时天气图综合研判】(约180字)：指出当前影响川渝的主要天气系统及其位置"
+             "（副热带/大陆高压、5880线/脊位、槽脊、低涡、切变线、锋面、冷空气路径等）、系统间的搭配，"
+             "并推断其对四川盆地高温或降水的总体影响。只依据图上实际可见信息，一字不得编造；看不清的部分不要臆测，"
+             "直接说“图面未提供/模糊”。")
+    content = [{"type": "text",
+                "text": "以下为中央气象台官方实时实况分析天气图，请综合研判影响川渝的天气系统及对盆地高温/降水的影响；看不清的不要臆测。"}]
+    for lab, b64 in b64_charts:
+        content.append({"type": "text", "text": "[%s]" % lab})
+        content.append({"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,%s" % b64}})
+    msg = [{"role": "system", "content": sys_p}, {"role": "user", "content": content}]
+    payload = json.dumps({"model": os.environ.get("OPENAI_MODEL", "gpt-4o-mini"),
+                          "messages": msg, "temperature": 0.3, "max_tokens": 600}).encode("utf-8")
+    try:
+        req = urllib.request.Request(base + "/chat/completions", data=payload,
+                                     headers={**UA, "Content-Type": "application/json",
+                                              "Authorization": "Bearer " + api_key})
+        with urllib.request.urlopen(req, timeout=75) as r:
+            j = json.loads(r.read().decode("utf-8"))
+        txt = j["choices"][0]["message"]["content"].strip()
+        return txt or None
+    except Exception as ex:
+        print("[visual] 失败:", ex)
+        return None
+
+
 # ---------- NMC 官方预报图 ----------
 NMC_PRECIP_PAGE = "http://www.nmc.cn/publish/precipitation/1-day.html"
 NMC_SAT_PAGE = "http://www.nmc.cn/publish/satellite.html"
@@ -2392,7 +2426,34 @@ def build_multilevel():
                 "供与上方 NMC 官方实况分析图横向对照（结果随加密格点质量波动，供参考）。</p></div>"
                 % (len(ML_SYS_LAT), len(ML_SYS_LON)))
         sys_read = head + "".join(cls)
-    read_html = "<div class='ml-read'>%s%s</div>" % (sys_read, "".join(read))
+
+    # ---- 0. 依据实时天气图 + 格点场 综合研判（置顶）：优先视觉LLM读官方实况图 ----
+    top_read = ""
+    if cap_ok:
+        cmap = {short: (lbl, tm, b64) for (i, short, lbl, tm, b64) in got}
+        pick = [("SFC", "地面海平面气压"), ("925", "925 hPa"), ("850", "850 hPa"),
+                ("700", "700 hPa"), ("500", "500 hPa")]
+        sel = [(cmap[s][0], cmap[s][2]) for s, _ in pick if s in cmap]
+        vis = _visual_review_charts(sel) if sel else None
+        if vis:
+            labels = "、".join("[%s]" % t for s, t in pick if s in cmap)
+            top_read = Blk("实时天气图综合研判",
+                           vis + "<span style='color:#8a99aa;font-size:12px'>（依据中央气象台官方实况分析图%s）</span>" % labels)
+        else:
+            anchor = "、".join(t for s, t in pick if s in cmap) or "实况图"
+            core = ""
+            if h500 is not None:
+                core = "中空500hPa平均高度约 <b>%d gpm</b>" % h500
+            if sysd:
+                s = (sysd.get("sfc", "").strip() + "；" if "sfc" in sysd else "") + sysd.get("h500", "").strip()
+                core = (core + "；" if core else "") + "加密格点空间场识别：" + s[:180]
+            if core:
+                top_read = Blk("实时天气图综合研判",
+                               "本研判以中央气象台官方【实时】实况分析图（%s）为锚，叠加多层格点与系统识别综合给出：%s。" % (anchor, core))
+            else:
+                top_read = Blk("实时天气图综合研判",
+                               "本研判以中央气象台官方【实时】实况分析图（%s）为锚定性给出；当前多层格点读场暂不可用，天气系统详情请以上方官方实况图为准。" % anchor)
+    read_html = "<div class='ml-read'>%s%s%s</div>" % (top_read, sys_read, "".join(read))
 
     return """<div class="card" id="mlcard"><h2><span class="no">11</span>多层次高空与地面形势研读（SFC~100hPa）</h2>
 <div class="sec-sub">NMC官方实况分析图 × 公开多层格点读场 · 自下而上解读川渝垂直配置，并识别槽/脊/高/低压/切变线/锋面</div>
