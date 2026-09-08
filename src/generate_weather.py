@@ -20,8 +20,15 @@
 """
 import argparse, base64, json, os, re, sys, urllib.request, urllib.parse, time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 import math
+
+# 站点按北京时间显示：Actions runner 默认 UTC，直接 datetime.now() 会让"生成时间"
+# 在清晨时段显示成前一天，误以为未更新。统一使用北京时区。
+BEIJING_TZ = timezone(timedelta(hours=8))
+def bj_now():
+    """返回带北京时区的当前时间。"""
+    return datetime.now(BEIJING_TZ)
 
 UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 NMC_WEATHER = "http://www.nmc.cn/rest/weather?stationid={code}"
@@ -607,7 +614,7 @@ def fetch_nmc_charts(out_dir):
         if m:
             base = m.group(1)  # YYYYMMDDHHMM
             ts = datetime.strptime(base, "%Y%m%d%H%M")
-            if (datetime.now() - ts).days <= 3:
+            if (bj_now().replace(tzinfo=None) - ts).days <= 3:
                 p = _dl_chart("https://" + m.group(0), os.path.join(out_dir, "cloud.jpg"))
                 charts["FY4B 卫星云图"] = p
     except Exception as ex:
@@ -1033,7 +1040,7 @@ def build_map_card(fetched, stations):
     s_cnt = sum(1 for s in sts if "四川" in s["province"])
     c_cnt = sum(1 for s in sts if "重庆" in s["province"])
     live_obs = fetch_station_live(sts)
-    live_ts = datetime.now().strftime("%H:%M")
+    live_ts = bj_now().strftime("%H:%M")
     return (MAP_CARD
             .replace("__STATIONS__", json.dumps(sts, ensure_ascii=False))
             .replace("__DATA__", json.dumps(pts, ensure_ascii=False))
@@ -2517,7 +2524,7 @@ def main():
     if not narr:
         narr = "（未启用 LLM 润色，采用上方规则化形势概览与分区风险，数据取官方实时。）"
 
-    render(fetched, vent, nmc_charts, narr, args.out, datetime.now(), alarms, alarm_cnt, stations)
+    render(fetched, vent, nmc_charts, narr, args.out, bj_now(), alarms, alarm_cnt, stations)
 
 
 if __name__ == "__main__":
